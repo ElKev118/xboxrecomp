@@ -30,6 +30,14 @@ from .config import is_code_address, is_data_address, va_to_file_offset
 #   Get-ChildItem "$env:WINSDK/Lib/*/um/x64" -Filter *.lib | ForEach-Object {
 #     & dumpbin /exports $_ }  # then keep the indent-only identifier lines
 _WIN32_EXPORTS = set()
+# Most switch-table slots read before giving up. A dense MSVC switch can be
+# far longer than 256 cases: Ghost Recon 2's message handler at 0x0024A2B0
+# bounds its index with `cmp eax, 0x128` (297 slots). Capped at 256, the last
+# 41 arms had no generated label and dispatched as unresolved indirect calls.
+# Reads still stop at the first slot outside the function, so a generous cap
+# does not invent arms.
+MAX_JUMP_TABLE_ENTRIES = 1024
+
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 _WIN32_EXPORTS_FILE = os.path.join(_DATA_DIR, "win32_api_names.txt")
 if os.path.exists(_WIN32_EXPORTS_FILE):
@@ -2570,7 +2578,7 @@ class Lifter:
         """Check if a jump target is outside the current function."""
         return not (self.func_start <= addr < self.func_end)
 
-    def _read_jump_table(self, table_va, max_entries=256):
+    def _read_jump_table(self, table_va, max_entries=MAX_JUMP_TABLE_ENTRIES):
         """Read 32-bit jump table entries from the XBE at a given VA.
         Returns list of target addresses. Stops when an entry is not a
         valid code address or max_entries is reached."""
@@ -2664,7 +2672,8 @@ class Lifter:
             inside.append(target)
         return inside
 
-    def _read_jump_table_backward(self, last_va, max_entries=256):
+    def _read_jump_table_backward(self, last_va,
+                                  max_entries=MAX_JUMP_TABLE_ENTRIES):
         """Like _read_jump_table, reading downward from last_va."""
         targets = []
         for i in range(max_entries):

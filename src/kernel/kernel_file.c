@@ -263,22 +263,22 @@ NTSTATUS __stdcall xbox_NtCreateFile(
      * the title reads STATUS_OBJECT_PATH_NOT_FOUND as "no such volume".
      *
      * Half-Life 2's CRT probes partition0 this way during startup and treats
-     * the failure as fatal. Redirecting to the directory that holds the image
-     * gives a handle that is valid for exactly what the caller is going to do
-     * with it, which is NtQueryVolumeInformationFile. */
+     * the failure as fatal. A read-only handle on the image itself is valid
+     * for exactly what the caller is going to do with it, which is
+     * NtQueryVolumeInformationFile -- and, unlike the containing directory
+     * this used to open, it still identifies the volume, so the size query
+     * can report the cluster size from the image's FATX superblock
+     * (XMountUtilityDrive checks it). */
     if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
         GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
         !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
-        WCHAR *slash = wcsrchr(win_path, L'\\');
-        if (slash && slash != win_path) {
-            *slash = 0;
-            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
-                     "NtCreateFile: directory open of a device image, "
-                     "using its containing directory instead");
-        }
-    }
-
-    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+        xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                 "NtCreateFile: directory open of a device image, "
+                 "opening the image read-only as the volume handle");
+        h = CreateFileW(win_path, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    } else if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
@@ -667,6 +667,46 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
+            /* A raw partition image carries its own FATX superblock, and the
+             * cluster size is whatever it was formatted with -- not always
+             * 16 KB. XMountUtilityDrive formats the cache partition with the
+             * cluster size from the XBE init flags (Ghost Recon 2 asks for
+             * 64 KB) and then rejects the volume with
+             * STATUS_UNRECOGNIZED_VOLUME unless this query reports it back. */
+            {
+                /* Read through a private handle: the title's handle may be
+                 * a volume/directory-style open that ReadFile rejects. */
+                WCHAR img[MAX_PATH];
+                unsigned char sb[512];
+                DWORD got = 0;
+                BOOL ok = FALSE;
+                if (FileHandle && FileHandle != INVALID_HANDLE_VALUE &&
+                    GetFinalPathNameByHandleW(FileHandle, img, MAX_PATH, 0) - 1 < MAX_PATH - 1) {
+                    HANDLE rh = CreateFileW(img, GENERIC_READ,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (rh != INVALID_HANDLE_VALUE) {
+                        ok = ReadFile(rh, sb, sizeof(sb), &got, NULL);
+                        CloseHandle(rh);
+                    }
+                }
+                {
+                    if (ok && got >= 12 && memcmp(sb, "FATX", 4) == 0) {
+                        ULONG spc = (ULONG)sb[8] | ((ULONG)sb[9] << 8) |
+                                    ((ULONG)sb[10] << 16) | ((ULONG)sb[11] << 24);
+                        if (spc && (spc & (spc - 1)) == 0 && spc <= 1024) {
+                            ULONGLONG old_cs = (ULONGLONG)info->BytesPerSector *
+                                               info->SectorsPerAllocationUnit;
+                            ULONGLONG new_cs = (ULONGLONG)XBOX_BYTES_PER_SECTOR * spc;
+                            info->SectorsPerAllocationUnit = spc;
+                            info->TotalAllocationUnits.QuadPart =
+                                info->TotalAllocationUnits.QuadPart * old_cs / new_cs;
+                            info->AvailableAllocationUnits.QuadPart =
+                                info->AvailableAllocationUnits.QuadPart * old_cs / new_cs;
+                        }
+                    }
+                }
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
             return STATUS_SUCCESS;
@@ -815,7 +855,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
+        /* An empty mask (Length 0, Buffer set) means "everything", same as no
+         * mask: XAPI's FindFirstFile("d:\\") passes one, and appending it gave
+         * "dir\\" -- which Windows rejects, so the title saw an empty disc.
+         * Ghost Recon 2 builds its whole resource index from that answer. */
+        if (FileName && FileName->Buffer && FileName->Length) {
             WCHAR pattern_wide[MAX_PATH];
             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                 pattern_wide, MAX_PATH);
@@ -826,7 +870,15 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
             ctx->find_handle = NULL;
+            /* An empty first answer is indistinguishable from a broken search
+             * inside the title (Ghost Recon 2 indexes its whole disc this way
+             * and fails much later with "could not load string resource"), so
+             * say which search found nothing. */
+            fprintf(stderr, "  [DIR] FindFirstFile '%ls' -> none (win32 err=%lu)\n",
+                    search_path, err);
+            fflush(stderr);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }

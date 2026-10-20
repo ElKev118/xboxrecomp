@@ -22,6 +22,9 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "fpconv.h"
+#include <stdarg.h>
+
+static void stream_trace(MCPXAPUState *d, uint16_t v, const char *fmt, ...);
 
 /* #define DEBUG_MCPX */
 
@@ -60,6 +63,7 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
+    apu_irq_stats.notifies++;
     d->set_irq = true;
 }
 
@@ -129,6 +133,7 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    stream_trace(d, v, "voice_off");
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -136,6 +141,7 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
                                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
     int notifier = MCPX_HW_NOTIFIER_SSLA_DONE;
     if (stream) {
+        apu_irq_stats.stream_offs++;
         assert(v < MCPX_HW_MAX_VOICES);
         assert(d->vp.ssl[v].ssl_index <= 1);
         notifier += d->vp.ssl[v].ssl_index;
@@ -164,6 +170,53 @@ static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
     assert(v < MCPX_HW_MAX_VOICES);
     uint64_t mask = 1ULL << (v % 64);
     return (qatomic_read(&d->vp.voice_locked[v / 64]) & mask) != 0;
+}
+
+/* ============================================================
+ * Stream voice event trace (RECOMP_APU_STREAM_TRACE)
+ *
+ * A title that streams audio (a movie player, streamed music) queues
+ * packets through the voice's two SSLs and waits for each SSL's "done"
+ * notifier before queueing more. When playback stalls, this log tells
+ * which side stopped: the title (no further SET_VOICE_SSL) or the VP
+ * (no further SSL done, or the voice ran dry / went idle). Budgeted so
+ * a long run cannot flood the log.
+ * ============================================================ */
+
+static int s_strace = -1;
+static int s_strace_budget = 4000;
+static uint8_t s_strace_dry[MCPX_HW_MAX_VOICES]; /* dry logged since last SSL set */
+static unsigned long s_vp_frames;   /* VP frames run: 1 frame = 32 samples at 48 kHz */
+
+static bool voice_is_stream(MCPXAPUState *d, uint16_t v)
+{
+    return voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                          NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
+}
+
+static void stream_trace(MCPXAPUState *d, uint16_t v, const char *fmt, ...)
+{
+    va_list ap;
+    if (s_strace < 0)
+        s_strace = apu_env_on("RECOMP_APU_STREAM_TRACE");
+    if (s_strace <= 0 || s_strace_budget <= 0)
+        return;
+    if (v >= MCPX_HW_MAX_VOICES || !voice_is_stream(d, v))
+        return;
+    s_strace_budget--;
+    fprintf(stderr, "[APU-STREAM] f=%lu v=%u idx=%d seg=%d A=%u/%u B=%u/%u act=%u pau=%u ",
+            s_vp_frames, (unsigned)v,
+            d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg,
+            (unsigned)d->vp.ssl[v].base[0], (unsigned)d->vp.ssl[v].count[0],
+            (unsigned)d->vp.ssl[v].base[1], (unsigned)d->vp.ssl[v].count[1],
+            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                           NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE),
+            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                           NV_PAVS_VOICE_PAR_STATE_PAUSED));
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
 }
 
 /* ============================================================
@@ -200,6 +253,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        stream_trace(d, (uint16_t)selected_handle, "VOICE_ON arg=%08X feav=%08X",
+                     argument, d->regs[NV_PAPU_FEAV]);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -285,6 +340,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_RELEASE: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        stream_trace(d, (uint16_t)selected_handle, "VOICE_RELEASE");
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -311,6 +367,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        stream_trace(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE),
+                     "VOICE_OFF method");
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
@@ -451,6 +509,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_SET_VOICE_SSL_A: {
+        apu_irq_stats.ssl_sets++;
         int ssl = 0;
         int current_voice = d->regs[NV_PAPU_FECV];
         assert(current_voice < MCPX_HW_MAX_VOICES);
@@ -458,9 +517,12 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        s_strace_dry[current_voice] = 0;
+        stream_trace(d, (uint16_t)current_voice, "SET_SSL_A arg=%08X", argument);
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
+        apu_irq_stats.ssl_sets++;
         int ssl = 1;
         int current_voice = d->regs[NV_PAPU_FECV];
         assert(current_voice < MCPX_HW_MAX_VOICES);
@@ -468,6 +530,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        s_strace_dry[current_voice] = 0;
+        stream_trace(d, (uint16_t)current_voice, "SET_SSL_B arg=%08X", argument);
         break;
     }
 
@@ -1113,13 +1177,18 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_NEW_VOICE, 0);
 
-    if (paused) return -1;
+    if (paused) {
+        if (stream) apu_irq_stats.stream_paused_frames++;
+        return -1;
+    }
 
     if (stream) {
+        apu_irq_stats.stream_frames++;
         if (!persist) {
             int eacur = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                                        NV_PAVS_VOICE_PAR_STATE_EACUR);
             if (eacur < NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE) {
+                stream_trace(d, (uint16_t)v, "off: not persist, eacur=%d", eacur);
                 voice_off(d, (uint16_t)v);
                 return -1;
             }
@@ -1132,6 +1201,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         count = d->vp.ssl[v].count[ssl_index];
 
         if (count == 0) {
+            if (!s_strace_dry[v]) {
+                s_strace_dry[v] = 1;
+                stream_trace(d, (uint16_t)v, "ran dry (SSL %d empty) persist=%d",
+                             ssl_index, (int)persist);
+            }
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -1274,6 +1348,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 /* Move to next segment */
             } else {
                 int next_index = (ssl_index + 1) % 2;
+                stream_trace(d, (uint16_t)v, "SSL %d done", ssl_index);
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
@@ -1633,6 +1708,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    s_vp_frames++;
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
@@ -1659,8 +1735,14 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                  * before the ISR has read the first. The rest trap on later
                  * frames, after the ISR has resumed the front end. */
                 if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
-                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+                    static int idle_logs = 200; /* one per frame otherwise */
+                    if (idle_logs > 0 && voice_is_stream(d, v)) {
+                        idle_logs--;
+                        stream_trace(d, v, "idle in list %d -> trap", list);
+                    }
                     fe_method(d, SE2FE_IDLE_VOICE, v);
+                }
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);

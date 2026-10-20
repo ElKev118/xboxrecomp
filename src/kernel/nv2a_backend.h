@@ -89,6 +89,78 @@ typedef struct {
     const Nv2aRenderState *state;
 } Nv2aBatch;
 
+/* ---- Programmable path (draw_xf) -------------------------------------
+ *
+ * What a GPU back end needs to draw a batch the way the title meant it,
+ * rather than as stage-0-times-diffuse: unclipped vertices with every
+ * output of the vertex stage, and the pixel stage's whole state -- four
+ * texture stages, the texture-shader program and the register combiners.
+ * A back end that sets draw_xf gets every vertex-program and fixed-function
+ * batch this way (draw() still gets the screen-space path).
+ */
+
+/* One vertex as the vertex stage produced it. pos: x, y in surface pixels
+ * (anti-aliasing scale included) and z in depth-buffer units, all already
+ * divided by w; w is the clip-space w, so (pos.xyz before the divide) can be
+ * rebuilt and the GPU clip the triangle itself. A vertex with w <= 0 is
+ * behind the eye and still sent: clipping is the back end's job here. The
+ * remaining outputs are as the program wrote them (oD0, oD1, oFog, oT0-3). */
+typedef struct {
+    float pos[4];
+    float d0[4], d1[4];
+    float fog[4];
+    float tex[4][4];
+} Nv2aVertexXf;
+
+/* One texture stage. Same fields as Nv2aTexture plus what the pixel stage
+ * needs to address it. tex coordinates in Nv2aVertexXf are normalised for
+ * swizzled and compressed formats and in texels for linear ones (normalised
+ * flag), as the hardware takes them. */
+typedef struct {
+    Nv2aTexture t;
+    uint32_t enabled;           /* stage has a texture bound and enabled */
+    uint32_t normalised;        /* coordinates arrive in [0,1] */
+    uint32_t cube;              /* six faces */
+    uint32_t palette;           /* guest address of the CLUT (P8), else 0 */
+    uint32_t format_word;       /* raw SET_TEXTURE_FORMAT */
+    uint32_t control0;          /* raw SET_TEXTURE_CONTROL0 (alpha kill...) */
+    uint32_t border_color;      /* SET_TEXTURE_BORDER_COLOR */
+} Nv2aTexStage;
+
+typedef struct {
+    Nv2aTexStage stage[4];
+    /* Register combiners and texture shader, raw (NV097 method values). */
+    uint32_t color_icw[8], alpha_icw[8];
+    uint32_t color_ocw[8], alpha_ocw[8];
+    uint32_t factor0[8], factor1[8];
+    uint32_t final0, final1;            /* SPECULAR_FOG_CW0/1 */
+    uint32_t final_c0, final_c1;        /* SPECULAR_FOG_FACTOR0/1 */
+    uint32_t control;                   /* COMBINER_CONTROL */
+    uint32_t stage_program;             /* SHADER_STAGE_PROGRAM */
+    uint32_t other_stage_input;         /* SHADER_OTHER_STAGE_INPUT */
+    uint32_t dot_rgb_mapping;           /* DOT_RGBMAPPING */
+    uint32_t clip_plane_mode;           /* SHADER_CLIP_PLANE_MODE */
+    uint32_t fog_enable, fog_color;     /* FOG_ENABLE, FOG_COLOR */
+    uint32_t shade_flat;                /* SHADE_MODE == FLAT */
+    uint32_t zeta_format;               /* 0 none, 1 Z16, 2 Z24S8 */
+    uint32_t z_float;                   /* CONTROL0 bit 12: float depth */
+    float    zmax;                      /* largest depth value (65535 / 16777215) */
+    /* The combiners above are the title's (it has set SET_COMBINER_* at
+     * least once); 0: draw texture 0 times diffuse, as the CPU path does. */
+    uint32_t rc_seen;
+    /* Fog factor from oFog.x: SET_FOG_MODE (GL enums) and SET_FOG_PARAMS
+     * 0/1 (bias, scale), as the executor's own fog_factor() uses them. */
+    uint32_t fog_mode;
+    float    fog_param[2];
+} Nv2aPixelState;
+
+typedef struct {
+    const Nv2aVertexXf    *vertices;    /* triangle list, count % 3 == 0 */
+    uint32_t               count;
+    const Nv2aRenderState *state;
+    const Nv2aPixelState  *pixel;
+} Nv2aBatchXf;
+
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
      * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
@@ -96,6 +168,18 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* Optional (NULL: not provided). draw_xf: see Nv2aBatchXf above.
+     * blit: NV09F image blit (SRCCOPY) between guest addresses, bpp bytes
+     * per pixel; returns 1 if the back end did it (its own copy of either
+     * surface), 0 to let the executor copy guest memory. present: the
+     * surface the title has just flipped to, for a back end that owns the
+     * display -- called before flip(). */
+    void (*draw_xf)(const Nv2aSurface *s, const Nv2aBatchXf *b);
+    int  (*blit)(uint32_t src_va, uint32_t src_pitch, uint32_t dst_va,
+                 uint32_t dst_pitch, uint32_t sx, uint32_t sy, uint32_t dx,
+                 uint32_t dy, uint32_t w, uint32_t h, uint32_t bpp);
+    void (*present)(uint32_t surface_va, uint32_t pitch, uint32_t width,
+                    uint32_t height, uint32_t aa_sx, uint32_t aa_sy);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts

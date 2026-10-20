@@ -4465,6 +4465,23 @@ static void bridge_NtFsControlFile(void)
 {
     uint32_t fsctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
+
+    /* XFormatUtilityDrive writes a fresh FATX volume through the raw
+     * partition handle, then locks/dismounts it so the next open mounts the
+     * new filesystem. The partition is a host image file here, so there is
+     * no mounted state to drop -- flushing is the whole job. Failing these
+     * made XAPI treat the format as failed and relaunch the title forever. */
+    if (fsctl == 0x00090018u ||    /* FSCTL_LOCK_VOLUME     */
+        fsctl == 0x0009001Cu ||    /* FSCTL_UNLOCK_VOLUME   */
+        fsctl == 0x00090020u) {    /* FSCTL_DISMOUNT_VOLUME */
+        HANDLE h = bridge_read_handle(STACK_ARG(0));
+        if (fsctl == 0x00090020u && h && h != INVALID_HANDLE_VALUE)
+            FlushFileBuffers(h);
+        bridge_write_iostatus(ios_va, 0, 0);
+        g_eax = 0;
+        return;
+    }
+
     fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu;

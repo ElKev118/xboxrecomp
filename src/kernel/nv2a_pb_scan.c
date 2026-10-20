@@ -25,6 +25,9 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -449,25 +452,107 @@ int nv2a_pb_dma_walk(void)
     return on;
 }
 
-/* The segment scan: walk commands from va to end_va. Returns the words
+/* Walk commands from va to end_va. Returns the words
  * consumed.
  *
  * A CALL runs a subroutine -- a pushbuffer somewhere else in memory -- up to
  * its RETURN, then carries on after the CALL. RenderWare on the Xbox compiles
  * static geometry into pushbuffers and draws it with a CALL, so skipping CALLs
  * loses whole meshes. The NV2A has one level of subroutine, so a CALL inside a
- * call is not followed. A JUMP outside a call ends the segment: the ring's
- * wrap is handled by the caller, which scans the two pieces separately.
+ * call is not followed. nv2a_pb_scan_follow walks the ring itself and calls
+ * this for each CALL; a JUMP outside a call ends the walk here.
  * Addresses are physical, like PUT's, and reach guest memory through the
  * contiguous window. */
+
+/* A method whose parameters ran past the end of the last top-level segment.
+ *
+ * PUT can stop inside a method: D3D kicks off with a long parameter list
+ * (inline vertices, a constant upload) only partly before it. The segment
+ * used to end there and forget the method, so the next segment -- starting
+ * at that PUT -- read the rest of the parameters as command headers: vertex
+ * data run as methods, state lost from the batch it belonged to, and, at the
+ * end of a lap, the ring's closing JUMP never recognised. Ghost Recon 2 then
+ * restarted the ring on stale words and presented the same two frames over
+ * and over. The DMA walk keeps the method pending (s_pend_*); so does this. */
+typedef struct {
+    uint32_t left, method, subch;
+    int noninc;
+} PbPending;
+static PbPending s_seg_pend;
+
+static int s_dry;                   /* decoding only: execute nothing */
+
+static void pb_seg_params(const uint8_t *mem, uint32_t *va, uint32_t end_va,
+                          uint32_t *words)
+{
+    while (s_seg_pend.left && *va != end_va
+           && (*va & 0x0FFFFFFFu) + 4 <= PB_RAM_BYTES) {
+        /* Answer kickoffs mid-walk; see pb_follow. */
+        if (!s_dry && s_exec_enabled && (++s_ack_tick & 0xFFu) == 0)
+            xbox_Nv2aAckBusyBits();
+        if (!s_dry)
+            note(s_seg_pend.subch, s_seg_pend.method);
+        if (s_exec_enabled && !s_dry)
+            nv2a_pb_exec_method(s_seg_pend.subch, s_seg_pend.method,
+                                *(const uint32_t *)(mem + *va));
+        if (!s_seg_pend.noninc)
+            s_seg_pend.method += 4;
+        s_seg_pend.left--;
+        *va += 4;
+        (*words)++;
+    }
+}
+
+/* The last top-level words decoded as headers, for nv2a_pb_segment_dump:
+ * when a lap's closing JUMP is not where the ring says it should be, this
+ * is what the walk took for commands on its way there. */
+#define PB_SEG_HIST 24
+static struct { uint32_t at, w; } s_seg_hist[PB_SEG_HIST];
+static unsigned s_seg_hist_n;
+
+void nv2a_pb_segment_dump(void)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    unsigned k, n = s_seg_hist_n < PB_SEG_HIST ? s_seg_hist_n : PB_SEG_HIST;
+
+    fprintf(stderr, "  [PB]   pending at segment start: %u params of %u:%04X%s\n",
+            s_seg_pend.left, s_seg_pend.subch, s_seg_pend.method,
+            s_seg_pend.noninc ? " (non-inc)" : "");
+    for (k = 0; k < n; k++) {
+        unsigned i = (s_seg_hist_n - n + k) % PB_SEG_HIST;
+        uint32_t at = s_seg_hist[i].at, w = s_seg_hist[i].w;
+        fprintf(stderr, "  [PB]   header %08X at %08X: subch %u method %04X"
+                " count %u%s\n", w, at & 0x0FFFFFFFu, (w >> 13) & 7u,
+                w & 0x1FFCu, (w >> 18) & 0x7FFu,
+                (w & 3u) == 1u ? " = JUMP" : (w & 3u) == 2u ? " = CALL" : "");
+    }
+    if (n) {
+        uint32_t at = s_seg_hist[(s_seg_hist_n - 1) % PB_SEG_HIST].at;
+        fprintf(stderr, "  [PB]   words before it:");
+        for (k = 16; k > 0; k--)
+            fprintf(stderr, " %08X", *(const uint32_t *)(mem + at - 4 * k));
+        fprintf(stderr, "\n");
+    }
+}
+
 static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                 uint32_t *jumps, uint32_t *unknown)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
 
+    if (!in_call)
+        pb_seg_params(mem, &va, end_va, &words);  /* the previous segment's */
+
+    if (end_va > (0x80000000u | PB_RAM_BYTES))
+        end_va = 0x80000000u | PB_RAM_BYTES;
     while (va < end_va && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
+        if (!in_call) {
+            s_seg_hist[s_seg_hist_n % PB_SEG_HIST].at = va;
+            s_seg_hist[s_seg_hist_n % PB_SEG_HIST].w = w;
+            s_seg_hist_n++;
+        }
         va += 4;
         words++;
 
@@ -477,8 +562,12 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             (*jumps)++;
             if (!in_call)
                 break;                        /* the ring: a jump ends it */
+            if ((target & 0x0FFFFFFFu) >= PB_RAM_BYTES)
+                break;
             va = 0x80000000u | (target & 0x0FFFFFFFu);
             end_va = va + 0x400000u;
+            if (end_va > (0x80000000u | PB_RAM_BYTES))
+                end_va = 0x80000000u | PB_RAM_BYTES;
             continue;
         }
         if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
@@ -500,10 +589,19 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
+            if (!in_call) {
+                s_seg_pend.left = count;
+                s_seg_pend.method = method;
+                s_seg_pend.subch = subch;
+                s_seg_pend.noninc = noninc;
+                pb_seg_params(mem, &va, end_va, &words);
+                continue;
+            }
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
-                if (s_exec_enabled)
+                if (!s_dry)
+                    note(subch, m);
+                if (s_exec_enabled && !s_dry)
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)(mem + va));
                 va += 4;
@@ -516,19 +614,210 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
     return words;
 }
 
-void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+/* The default walk: from the previous PUT to this one, the way the GPU's
+ * DMA engine goes -- following every JUMP -- but without publishing GET
+ * (see nv2a_pb_dma_walk for why that is opt-in).
+ *
+ * The segment scan below stops at the first JUMP, taking it for the ring's
+ * wrap. It is not always that: XDK D3D runs a recorded pushbuffer by
+ * JUMPing to it, and the recorded buffer JUMPs back into the ring when it
+ * is done. Ghost Recon 2 draws its characters and vehicles that way, so
+ * stopping lost them, lost the rest of the segment after the jump back, and
+ * at the end of a lap mistook the jump out for the ring's closing JUMP --
+ * the ring then restarted on stale words and replayed old frames. Following
+ * the JUMPs, the walk wraps the ring the same way it leaves it: by going
+ * where the JUMP says, until it is at PUT. */
+/* The ring's extent as the PUTs seen in it say (physical), for telling a
+ * JUMP that stays in the ring from one into a recorded pushbuffer. */
+static uint32_t s_ring_lo, s_ring_hi;
+
+static int pb_in_ring(uint32_t phys)
 {
-    uint32_t words, jumps = 0, unknown = 0;
+    phys &= PB_PHYS_MASK;
+    return s_ring_hi && phys + 0x10000u >= s_ring_lo && phys <= s_ring_hi + 0x10000u;
+}
 
-    if (!pb_walk_enabled() || end_va <= start_va)
+static int pb_follow(uint32_t from_phys, uint32_t put_phys, int dry)
+{
+    /* A recorded pushbuffer (D3D RunPushBuffer) is entered by a JUMP from
+     * the ring and left by a JUMP back to just after it. D3D patches that
+     * return JUMP every time the buffer runs, and this walk runs behind the
+     * title: by the time it reads the buffer, the return names the latest
+     * call site, not the one being walked. Followed as written it skipped
+     * everything between the two calls -- the models the title draws that
+     * way never appeared, fence releases were lost -- or, when the latest
+     * call site was the one ahead, went round between them for ever. So
+     * remember where the ring was left and go back there. */
+    int in_rec = 0;
+    uint32_t ret_va = 0;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t va  = 0x80000000u | (from_phys & PB_PHYS_MASK);
+    uint32_t end = 0x80000000u | (put_phys  & PB_PHYS_MASK);
+    uint32_t start = va;
+    uint32_t words = 0, jumps = 0, unknown = 0;
+
+    s_dry = dry;
+    pb_seg_params(mem, &va, end, &words);        /* the method PUT split */
+
+    while (va != end && words < 0x400000u && unknown <= 64) {
+        /* Keep answering kickoffs while executing (xbox_Nv2aAckBusyBits):
+         * this thread is also the one that clears the bit every D3D kickoff
+         * spins on, and running a pushbuffer -- rasterising a frame on the
+         * CPU -- takes long enough that a kickoff waiting for the whole walk
+         * waits that long. Ghost Recon 2's movie player kicks off once per
+         * decoded frame and spent 99 % of its time in that spin (sampled,
+         * sub_0042F790): the cinematic ran at a frame a second and its audio
+         * starved. The DMA walk always did this; the follow walk forgot. */
+        if (!dry && s_exec_enabled && (++s_ack_tick & 0xFFu) == 0)
+            xbox_Nv2aAckBusyBits();
+        if (va == start && words) {
+            va = start + 4;                       /* round the ring: not a */
+            break;                                /* way to PUT (see below) */
+        }
+        if ((va & 0x0FFFFFFFu) + 4 > PB_RAM_BYTES)
+            break;                                /* walked off guest RAM */
+        uint32_t w = *(const uint32_t *)(mem + va);
+        s_seg_hist[s_seg_hist_n % PB_SEG_HIST].at = va;
+        s_seg_hist[s_seg_hist_n % PB_SEG_HIST].w = w;
+        s_seg_hist_n++;
+        va += 4;
+        words++;
+
+        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                             : (w & 0x1FFFFFFCu);
+            if ((target & 0x0FFFFFFFu) >= PB_RAM_BYTES)
+                break;                            /* data read as a JUMP */
+            jumps++;
+            if (!in_rec && !pb_in_ring(target)) {
+                in_rec = 1;                       /* into a recorded buffer */
+                ret_va = va;                      /* the word after the JUMP */
+            } else if (in_rec && pb_in_ring(target)) {
+                /* Back to where we left. XDK D3D leaves room after its
+                 * JUMP and returns past it; the word after the JUMP holds
+                 * that return address, a few words on. Taken only when it
+                 * says exactly that; otherwise the word after the JUMP. */
+                uint32_t after = *(const uint32_t *)(mem + ret_va);
+                uint32_t ret_phys = ret_va & PB_PHYS_MASK;
+                static unsigned n_skip, n_plain;
+                in_rec = 0;
+                if ((after & 3u) == 0 && after > ret_phys && after - ret_phys <= 64) {
+                    va = 0x80000000u | after;
+                    n_skip++;
+                } else {
+                    va = ret_va;
+                    n_plain++;
+                }
+                if (!dry && (n_skip + n_plain) % 20000 == 1)
+                    fprintf(stderr, "  [PB] recorded-buffer returns: %u past D3D's"
+                            " gap, %u right after the JUMP\n", n_skip, n_plain);
+                continue;
+            }
+            va = 0x80000000u | (target & PB_PHYS_MASK);
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u)     /* RETURN outside a call */
+            continue;
+        if ((w & 3u) == 2u) {                     /* CALL */
+            uint32_t sub = 0x80000000u | (w & PB_PHYS_MASK);
+            if ((w & PB_PHYS_MASK) >= PB_RAM_BYTES)
+                break;                            /* data read as a CALL */
+            s_tot_calls++;
+            words += pb_walk_segment(sub, sub + 0x400000u, 1, &jumps, &unknown);
+            continue;
+        }
+        if ((w & 0x00030003u) == 0u) {
+            s_seg_pend.left   = (w >> 18) & 0x7FFu;
+            s_seg_pend.method =  w & 0x1FFCu;
+            s_seg_pend.subch  = (w >> 13) & 7u;
+            s_seg_pend.noninc = (w & 0xE0000000u) == 0x40000000u;
+            pb_seg_params(mem, &va, end, &words);
+            unknown = 0;
+            continue;
+        }
+        unknown++;
+    }
+    s_dry = 0;
+    if (va != end) {
+        if (dry) {
+            static unsigned said_dry;
+            if (said_dry++ < 6) {
+                fprintf(stderr, "  [PB] dry walk %08X -> %08X stopped at %08X"
+                        " (%u words, %u jumps, %u unknown)%s\n", from_phys, put_phys,
+                        va & 0x0FFFFFFFu, words, jumps, unknown,
+                        va == start + 4 ? " -- came round to the start" : "");
+                nv2a_pb_segment_dump();
+            }
+        }
+        if (!dry) {
+            static unsigned said;
+            if (said++ < 4) {
+                fprintf(stderr, "  [PB] walk %08X -> %08X lost sync at %08X"
+                        " (%u words, %u jumps)\n", from_phys, put_phys,
+                        va & 0x0FFFFFFFu, words, jumps);
+                nv2a_pb_segment_dump();
+            }
+        }
+        return 0;
+    }
+    if (!dry) {
+        s_tot_words += words;
+        s_tot_unknown += unknown;
+        s_tot_jumps += jumps;
+        s_tot_segments++;
+    }
+    return 1;
+}
+
+/* Walk only a path that is known to arrive. A first pass decodes without
+ * executing; only if it reaches PUT does the second run the commands.
+ *
+ * There is not always a path. A title that makes a second device (Ghost
+ * Recon 2: one for the boot splash, one for the game) moves PUT into a new
+ * ring that nothing in the old one jumps to; walked anyway, the old ring
+ * went round and round -- 4 M words, 4000 jumps -- running stale device
+ * init and frames, after which the title sat on its title screen and START
+ * did nothing. Without a path, the walk drops what is pending and starts
+ * again at this PUT, which D3D only ever sets at a command boundary. */
+/* The thread that executes the pushbuffer, for a host-side sampling
+ * profiler (the game's RECOMP_SAMPLE_THREAD=pb): a duplicated handle, set on
+ * the first walk. */
+void *g_pb_exec_thread;
+
+void nv2a_pb_scan_follow(uint32_t from_phys, uint32_t put_phys)
+{
+    PbPending saved;
+
+#ifdef _WIN32
+    if (!g_pb_exec_thread)
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                        GetCurrentProcess(), (HANDLE *)&g_pb_exec_thread,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT
+                        | THREAD_QUERY_INFORMATION, FALSE, 0);
+#endif
+
+    if (!pb_walk_enabled() || (from_phys & PB_PHYS_MASK) == (put_phys & PB_PHYS_MASK))
         return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
-
-    words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
-
-    s_tot_words += words;
-    s_tot_unknown += unknown;
-    s_tot_jumps += jumps;
-    s_tot_segments++;
+    /* Learn the ring's extent from the PUTs. */
+    {
+        uint32_t f = from_phys & PB_PHYS_MASK, p = put_phys & PB_PHYS_MASK;
+        if (!s_ring_hi) { s_ring_lo = s_ring_hi = f; }
+        if (f < s_ring_lo) s_ring_lo = f;
+        if (p < s_ring_lo) s_ring_lo = p;
+        if (f > s_ring_hi) s_ring_hi = f;
+        if (p > s_ring_hi) s_ring_hi = p;
+    }
+    saved = s_seg_pend;
+    if (!pb_follow(from_phys, put_phys, 1)) {
+        static unsigned said;
+        if (said++ < 8)
+            fprintf(stderr, "  [PB] no path %08X -> %08X: ring changed, not"
+                    " walked\n", from_phys, put_phys);
+        s_seg_pend.left = 0;
+        /* A new ring (a second device): learn its extent afresh. */
+        s_ring_lo = s_ring_hi = put_phys & PB_PHYS_MASK;
+        return;
+    }
+    s_seg_pend = saved;
+    pb_follow(from_phys, put_phys, 0);
 }

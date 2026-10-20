@@ -67,6 +67,12 @@ int  xbox_FramebufferDumpBmp(const char *path);
  * UTF-16 title (40 chars max); the stats come from each flip. */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
+/* A game-side presenter instead of (or as well as) the window above: called
+ * on the executor's thread at every flip with the finished frame as w x h
+ * X8R8G8B8. The buffer is reused for the next frame; copy what is kept.
+ * Windows only for now (fb_present.c). */
+typedef void (*xbox_present_hook_t)(const uint32_t *xrgb, uint32_t w, uint32_t h);
+void xbox_FramebufferSetPresentHook(xbox_present_hook_t hook);
 
 #if !defined(_WIN32)
 /* POSIX hosts: the framebuffer window needs the process main thread (AppKit

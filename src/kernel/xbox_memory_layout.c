@@ -1451,7 +1451,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * guess. */
                     extern void nv2a_pb_resync(uint32_t);
                     extern int  nv2a_pb_dma_walk(void);
-                    extern void nv2a_pb_scan_segment(uint32_t, uint32_t);
+                    extern void nv2a_pb_scan_follow(uint32_t, uint32_t);
 
                     if (nv2a_pb_dma_walk()) {
                         uint32_t get_now = *(volatile uint32_t *)
@@ -1467,27 +1467,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         if (put != last_put)
                             nv2a_pb_scan(put);
                     } else {
-                        /* The segment scan, the default: the bytes between
-                         * the previous PUT and this one. The pushbuffer is a
-                         * ring, so PUT coming back below where it was is a
-                         * wrap, not a rewind; the ring's bounds are learned
-                         * from the lowest and highest PUT seen. */
-                        static uint32_t put_lo, put_hi;
-                        if (!put_lo || put < put_lo) put_lo = put;
-                        if (put > put_hi) put_hi = put;
-                        if (last_put && put > last_put) {
-                            nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                                 XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                        } else if (last_put && put < last_put) {
-                            if (put_hi > last_put)
-                                nv2a_pb_scan_segment(
-                                    XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                    XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                            if (put > put_lo)
-                                nv2a_pb_scan_segment(
-                                    XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                    XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        }
+                        /* The default: walk from the previous PUT to this
+                         * one, following the JUMPs -- out to recorded
+                         * pushbuffers and back, and round the ring's wrap --
+                         * as the GPU would (nv2a_pb_scan_follow). The ring's
+                         * bounds used to be guessed from the lowest and
+                         * highest PUT seen, and every JUMP was taken for
+                         * the wrap; in Ghost Recon 2 the lowest PUT was the
+                         * boot splash's ring (each wrap replayed its logo)
+                         * and the JUMPs were mostly recorded pushbuffers
+                         * (characters and vehicles never drawn). */
+                        if (last_put && put != last_put)
+                            nv2a_pb_scan_follow(last_put, put);
                     }
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the

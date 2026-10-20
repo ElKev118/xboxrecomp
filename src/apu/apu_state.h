@@ -586,5 +586,10 @@ typedef struct {
     unsigned traps;             /* front-end traps latched (fe_method) */
     unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
     unsigned fe_trapped_frames; /* frames that found FECTL trapped */
+    unsigned notifies;          /* voice notifier writes (set_notify_status) */
+    unsigned ssl_sets;          /* SET_VOICE_SSL_A/B methods (stream packets queued) */
+    unsigned stream_frames;     /* frames a stream voice was processed */
+    unsigned stream_offs;       /* stream voices switched off */
+    unsigned stream_paused_frames; /* frames a stream voice sat paused */
 } ApuIrqStats;
 extern ApuIrqStats apu_irq_stats;

@@ -26,9 +26,36 @@ extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
  * filling a disk, and is deliberately generous: a budget that runs out before
  * the interesting part turns "no trace here" into a false negative, which is
  * worse than a large file. Override with RECOMP_TRACE_BUDGET. */
+/* RECOMP_TRACE_FLAG=<file>: trace only while that file exists. The moment
+ * that matters can be minutes into a run, after the traced functions have
+ * already run hot elsewhere -- Ghost Recon 2's movie player decodes the menu
+ * videos for minutes before the cinematic in question opens, and tracing all
+ * of it both exhausted the budget and slowed the boot to a crawl. Creating
+ * the file when the moment comes opens the trace there. The file is checked
+ * every 4096 calls, so a closed gate costs a counter increment. */
+static int trace_gate_open(void)
+{
+    static const char *flag = (const char *)-1;
+    static unsigned calls;
+    static int open_;
+    if (flag == (const char *)-1)
+        flag = getenv("RECOMP_TRACE_FLAG");
+    if (!flag)
+        return 1;
+    if ((calls++ & 4095u) == 0) {
+        FILE *f = fopen(flag, "rb");
+        open_ = f != NULL;
+        if (f)
+            fclose(f);
+    }
+    return open_;
+}
+
 static long trace_budget(void)
 {
     static long budget = -1;
+    if (!trace_gate_open())
+        return 0;
     if (budget < 0) {
         const char *env = getenv("RECOMP_TRACE_BUDGET");
         budget = env ? strtol(env, NULL, 0) : 400000;

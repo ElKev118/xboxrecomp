@@ -30,6 +30,7 @@
  * is the thing that receives the keys, so that is what has to remember
  * them. */
 #include "keyboard.h"   /* src/input */
+#include "video_player.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -74,29 +75,29 @@ void xbox_FramebufferWindowSetAA(uint32_t sy)
     s_fb_aa_sy = sy ? sy : 1;
 }
 
-/* Called by the pushbuffer executor when the title flips. */
-void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+/* A game-side presenter (an SDL/Vulkan window, say) in place of the GDI
+ * window: it gets every finished frame, converted to X8R8G8B8 at the
+ * display size, on the executor's thread. Registering one is how a title
+ * replaces this window without RECOMP_FB_WINDOW. */
+static xbox_present_hook_t s_present_hook;
+static uint32_t           *s_hook_buf;
+
+void xbox_FramebufferSetPresentHook(xbox_present_hook_t hook)
+{
+    s_present_hook = hook;
+}
+
+/* One finished frame from guest memory into a w x h X8R8G8B8 buffer. */
+static void fb_copy_frame(uint32_t *out, uint32_t fb_va, uint32_t pitch)
 {
     const uint8_t *src;
-    LONG next;
     uint32_t bpp, x, y;
 
-    if (!s_fb_running || !fb_va || !pitch)
-        return;
-    if (getenv("RECOMP_FB_VA"))
-        return;                       /* pinned: leave the old path alone */
-    next = (s_present_idx == 0) ? 1 : 0;
-    if (!s_present[next]) {
-        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
-                                             4);
-        if (!s_present[next])
-            return;
-    }
     bpp = pitch / s_fb_width;
     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
     for (y = 0; y < s_fb_height; y++) {
         const uint8_t *row = src + (size_t)y * pitch * (bpp == 8 ? s_fb_aa_sy : 1);
-        uint32_t *dst = s_present[next] + (size_t)y * s_fb_width;
+        uint32_t *dst = out + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
@@ -119,6 +120,35 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             memset(dst, 0, (size_t)s_fb_width * 4);
         }
     }
+}
+
+/* Called by the pushbuffer executor when the title flips. */
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+{
+    LONG next;
+
+    if (!fb_va || !pitch)
+        return;
+    if (s_present_hook) {
+        if (!s_hook_buf)
+            s_hook_buf = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+        if (s_hook_buf) {
+            fb_copy_frame(s_hook_buf, fb_va, pitch);
+            s_present_hook(s_hook_buf, s_fb_width, s_fb_height);
+        }
+    }
+    if (!s_fb_running)
+        return;
+    if (getenv("RECOMP_FB_VA"))
+        return;                       /* pinned: leave the old path alone */
+    next = (s_present_idx == 0) ? 1 : 0;
+    if (!s_present[next]) {
+        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
+                                             4);
+        if (!s_present[next])
+            return;
+    }
+    fb_copy_frame(s_present[next], fb_va, pitch);
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
 }

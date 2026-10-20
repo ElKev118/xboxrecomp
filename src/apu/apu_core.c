@@ -281,10 +281,23 @@ static void apu_deliver_irq(MCPXAPUState *d)
     qemu_mutex_lock(&d->lock);
 
     {
-        static unsigned n;
+        static unsigned n, claimed, declined;
+        static DWORD last_report;
+        DWORD now = GetTickCount();
+        if (g_eax & 1) claimed++; else declined++;
         if (n++ < 3) {
             fprintf(stderr, "[APU] interrupt delivered to 0x%08X -> %s\n",
                     routine, (g_eax & 1) ? "claimed" : "declined");
+            fflush(stderr);
+        }
+        /* The first three say the line works; whether it keeps working --
+         * stream packets completing, a movie's audio clock advancing -- is
+         * only visible as a rate. */
+        if (now - last_report >= 2000) {
+            last_report = now;
+            fprintf(stderr, "[APU] irq totals: %u delivered (%u claimed, %u declined), "
+                    "ISTS=0x%08X IEN=0x%08X\n", n, claimed, declined,
+                    d->regs[NV_PAPU_ISTS], d->regs[NV_PAPU_IEN]);
             fflush(stderr);
         }
     }
@@ -840,6 +853,26 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     if (!(xa2_is_active() && d->pace_stalled))
         apu_wav_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
 
+    /* RECOMP_AUDIO_VOLUME=<0..100>: host output level in percent (0 mutes).
+     * After the WAV tap, so a capture still records what the title made.
+     * The device keeps being fed at the same pace: the title's timing does
+     * not change with the volume. */
+    {
+        static int vol = -1;
+        if (vol < 0) {
+            const char *e = getenv("RECOMP_AUDIO_VOLUME");
+            vol = e ? atoi(e) : 100;
+            if (vol < 0) vol = 0;
+            if (vol > 100) vol = 100;
+        }
+        if (vol != 100) {
+            int16_t *p = (int16_t *)period;
+            int i;
+            for (i = 0; i < MIXER_FRAME_SAMPLES * 2; i++)
+                p[i] = (int16_t)((int32_t)p[i] * vol / 100);
+        }
+    }
+
     if (xa2_is_active()) {
         if (!d->pace_stalled) {
             int q = hs_poll();
@@ -1042,9 +1075,13 @@ static void apu_irq_stats_line(void)
     if (now < s_irq_next_ns)
         return;
     if (s_irq_next_ns)
-        fprintf(stderr, "[APU-IRQ] traps %u se_frames %u fe-trapped-frames %u underruns %u\n",
+        fprintf(stderr, "[APU-IRQ] traps %u se_frames %u fe-trapped-frames %u notifies %u "
+                "ssl_sets %u stream_frames %u stream_offs %u stream_paused %u underruns %u\n",
                 apu_irq_stats.traps, apu_irq_stats.se_frames,
-                apu_irq_stats.fe_trapped_frames, xa2_underruns());
+                apu_irq_stats.fe_trapped_frames, apu_irq_stats.notifies,
+                apu_irq_stats.ssl_sets, apu_irq_stats.stream_frames,
+                apu_irq_stats.stream_offs, apu_irq_stats.stream_paused_frames,
+                xa2_underruns());
     s_irq_next_ns = now + 5000000000ull;
 }
 

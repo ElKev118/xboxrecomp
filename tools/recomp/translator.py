@@ -23,7 +23,8 @@ import sys
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
-from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+from .lifter import (MAX_JUMP_TABLE_ENTRIES, Lifter, lift_basic_block,
+                     detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
@@ -1349,7 +1350,7 @@ class FunctionTranslator:
         arms = {}
         for start, end, table in sites:
             following = bisect.bisect_right(tables, table)
-            limit = table + 4 * 256
+            limit = table + 4 * MAX_JUMP_TABLE_ENTRIES
             if following < len(tables):
                 limit = min(limit, tables[following])
             # MSVC places a switch table after the code it indexes.
@@ -1658,7 +1659,8 @@ class FunctionTranslator:
         return 0
 
     def _read_local_jump_table(self, table_va, lower, upper,
-                               max_entries=256, min_entry_va=None):
+                               max_entries=MAX_JUMP_TABLE_ENTRIES,
+                               min_entry_va=None):
         """Read the contiguous pointer cluster around an indexed-jump base."""
         def scan(step, first):
             targets = []
