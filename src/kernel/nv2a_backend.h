@@ -152,6 +152,9 @@ typedef struct {
      * 0/1 (bias, scale), as the executor's own fog_factor() uses them. */
     uint32_t fog_mode;
     float    fog_param[2];
+    /* SET_SURFACE_FORMAT colour field: 4 X8R8G8B8_Z8 / 5 _O8 (alpha
+     * written as 0 / 1), 8 A8R8G8B8, 3 R5G6B5, 1/2 X1R5G5B5 ... */
+    uint32_t color_format;
 } Nv2aPixelState;
 
 typedef struct {
