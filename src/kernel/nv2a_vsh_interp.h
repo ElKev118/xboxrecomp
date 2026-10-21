@@ -50,6 +50,11 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 
+/* The loaded program and constants, for a back end that runs the program
+ * itself (nv2a_vsh_glsl.h). cxt_write: SET_TRANSFORM_PROGRAM_CXT_WRITE_EN. */
+const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *cxt_write))[4];
+const float (*nv2a_vsh_constants(void))[4];
+
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 const float *nv2a_vsh_constant(uint32_t index);   /* for traces */

@@ -36,6 +36,7 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_interp.h"
+#include "nv2a_vsh_glsl.h"
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
 #if defined(_WIN32)
@@ -2836,18 +2837,12 @@ static void backend_xf_push(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     memcpy(&s_xbuf[s_xcount++], c, sizeof(Nv2aVertexXf));
 }
 
-static void backend_xf_flush(void)
+/* The pixel stage's whole state, as a GPU back end needs it. */
+static void current_pixel_state(Nv2aPixelState *pxp)
 {
-    static Nv2aPixelState px;
-    Nv2aSurface surf;
-    Nv2aRenderState rs;
-    Nv2aBatchXf batch;
+#define px (*pxp)
     int st;
 
-    if (!s_xcount)
-        return;
-    current_surface(&surf);
-    current_render_state(&rs);
     memset(&px, 0, sizeof px);
     for (st = 0; st < 4; st++) {
         const Texture *t = &s_gpu.texs[st];
@@ -2898,6 +2893,21 @@ static void backend_xf_flush(void)
     px.fog_mode = s_gpu.fog_mode;
     px.fog_param[0] = s_gpu.fog_param[0];
     px.fog_param[1] = s_gpu.fog_param[1];
+#undef px
+}
+
+static void backend_xf_flush(void)
+{
+    static Nv2aPixelState px;
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aBatchXf batch;
+
+    if (!s_xcount)
+        return;
+    current_surface(&surf);
+    current_render_state(&rs);
+    current_pixel_state(&px);
     batch.vertices = s_xbuf;
     batch.count = s_xcount;
     batch.state = &rs;
@@ -3024,9 +3034,158 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
+/* ---- draw_vsh: the vertex program on the GPU ------------------------- */
+
+/* RECOMP_VK_GPU_VSH=0 keeps every program on the CPU (the reference path). */
+static int gpu_vsh_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_GPU_VSH");
+        on = !e || atoi(e) != 0;
+    }
+    return on && s_backend && s_backend->draw_vsh;
+}
+
+/* One triangle of the batch's primitive, as positions in s_gpu.idx order,
+ * wound like the CPU path winds it (strips: every other one swapped). */
+static uint32_t prim_triangles(uint32_t n, uint32_t *tri)
+{
+    uint32_t i, k = 0;
+
+#define TRI(a, b, c) do { tri[k++] = (a); tri[k++] = (b); tri[k++] = (c); } while (0)
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++)
+            if (i & 1) TRI(i + 1, i, i + 2); else TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) TRI(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) { TRI(i, i + 1, i + 2); TRI(i, i + 2, i + 3); }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) { TRI(i, i + 1, i + 3); TRI(i, i + 3, i + 2); }
+        break;
+    default:
+        break;
+    }
+#undef TRI
+    return k;
+}
+
+/* Returns 1 when the back end drew the batch with its own vertex program. */
+static int raster_batch_gpu_vsh(void)
+{
+    static float    *inputs;           /* NV_MAX_INDICES * 16 vec4s */
+    static uint32_t *tri, *slot_of;    /* triangle positions; position -> vertex */
+    static uint32_t *hkey, *hval, hsize;
+    static Nv2aPixelState px;
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aBatchVsh b;
+    Nv2aVshInfo info;
+    const uint32_t (*prog)[4];
+    uint32_t start, cxt, n = s_gpu.idx_count, i, a, nv = 0, ntri, ni = 0;
+    uint8_t regs[16];
+
+    if (!gpu_vsh_enabled() || !batch_uses_program())
+        return 0;
+    prog = nv2a_vsh_program(&start, &cxt);
+    if (!nv2a_vsh_scan(prog, NV2A_VSH_SLOTS, start, &info))
+        return 0;
+    if (info.writes_consts && cxt)             /* writes c[]: CPU only */
+        return 0;
+    if (!inputs) {
+        inputs = (float *)malloc(sizeof(float) * 4 * 16 * NV_MAX_INDICES);
+        tri = (uint32_t *)malloc(sizeof(uint32_t) * NV_MAX_INDICES * 6);
+        slot_of = (uint32_t *)malloc(sizeof(uint32_t) * NV_MAX_INDICES);
+        hsize = 1u << 18;                      /* >= 2 * NV_MAX_INDICES */
+        hkey = (uint32_t *)malloc(sizeof(uint32_t) * hsize);
+        hval = (uint32_t *)malloc(sizeof(uint32_t) * hsize);
+        if (!inputs || !tri || !slot_of || !hkey || !hval)
+            return 0;
+    }
+    for (a = 0; a < 16; a++)
+        if (info.inputs & (1u << a))
+            regs[ni++] = (uint8_t)a;
+
+    /* Distinct vertices: indexed batches name the same vertex many times,
+     * and the program then runs once per vertex, not once per corner. */
+    memset(hkey, 0xFF, sizeof(uint32_t) * hsize);
+    for (i = 0; i < n; i++) {
+        uint32_t key = s_gpu.idx[i], h = (key * 2654435761u) & (hsize - 1);
+        while (hkey[h] != 0xFFFFFFFFu && hkey[h] != key)
+            h = (h + 1) & (hsize - 1);
+        if (hkey[h] == key) {
+            slot_of[i] = hval[h];
+            continue;
+        }
+        hkey[h] = key;
+        hval[h] = nv;
+        slot_of[i] = nv;
+        {
+            float *dst = inputs + (size_t)nv * ni * 4;
+            uint32_t k;
+            for (k = 0; k < ni; k++, dst += 4) {
+                uint32_t r = regs[k];
+                dst[0] = dst[1] = dst[2] = 0.0f; dst[3] = 1.0f;
+                /* As transform_vertex: an attribute with no array reads the
+                 * value last set with SET_VERTEX_DATA*. */
+                if (!fetch_attr(&s_gpu.attr[r], key, dst) && r < NV_VERTEX_ATTRS
+                    && (!s_gpu.attr[r].size || !s_gpu.attr[r].stride))
+                    memcpy(dst, s_gpu.imm_attr[r], sizeof(float) * 4);
+            }
+        }
+        nv++;
+    }
+    ntri = prim_triangles(n, tri);
+    if (!ntri)
+        return 1;                              /* nothing to draw, as the CPU path */
+    for (i = 0; i < ntri; i++)
+        tri[i] = slot_of[tri[i]];
+
+    current_surface(&surf);
+    current_render_state(&rs);
+    current_pixel_state(&px);
+    memset(&b, 0, sizeof b);
+    b.inputs = inputs;
+    b.nverts = nv;
+    b.ninputs = ni;
+    memcpy(b.input_reg, regs, sizeof regs);
+    b.indices = tri;
+    b.nindices = ntri;
+    b.program = prog;
+    b.nslots = NV2A_VSH_SLOTS;
+    b.start = start;
+    b.program_hash = info.hash;
+    b.constants = nv2a_vsh_constants();
+    b.aa_sx = s_gpu.aa_sx;
+    b.aa_sy = s_gpu.aa_sy;
+    b.state = &rs;
+    b.pixel = &px;
+    if (!s_backend->draw_vsh(&surf, &b))
+        return 0;
+    s_gpu.batches_program++;
+    s_gpu.verts_program += n;
+    s_gpu.tris_drawn += ntri / 3;
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+    note_drawn();
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
+
+    if (raster_batch_gpu_vsh())
+        return;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;

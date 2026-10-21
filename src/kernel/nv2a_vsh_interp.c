@@ -183,6 +183,18 @@ static void dump_program(uint32_t start)
     fflush(stderr);
 }
 
+const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *cxt_write))[4]
+{
+    if (start) *start = s_start_slot;
+    if (cxt_write) *cxt_write = s_cxt_write;
+    return (const uint32_t (*)[4])s_program;
+}
+
+const float (*nv2a_vsh_constants(void))[4]
+{
+    return (const float (*)[4])s_const;
+}
+
 const float *nv2a_vsh_constant(uint32_t index)
 {
     return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];

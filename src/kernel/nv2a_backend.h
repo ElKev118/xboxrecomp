@@ -185,6 +185,30 @@ typedef struct {
     const Nv2aPixelState  *pixel;
 } Nv2aBatchXf;
 
+/* The programmable path with the vertex program left to the back end
+ * (draw_vsh): the program's inputs, as floats, for each distinct vertex the
+ * batch uses, an index list of triangles over them (strips and fans already
+ * expanded, every triangle wound like the first), the program and its
+ * constants. The back end compiles the program (nv2a_vsh_glsl.h) and runs it
+ * per vertex; the outputs mean what Nv2aVertexXf's fields do -- oPos in
+ * surface pixels of the program's viewport (multiply x, y by aa_sx/aa_sy),
+ * z in depth units, both divided by w; oPos.w == +0 means 1. */
+typedef struct {
+    const float           *inputs;      /* nverts * ninputs vec4s          */
+    uint32_t               nverts;
+    uint32_t               ninputs;     /* attributes packed per vertex     */
+    uint8_t                input_reg[16]; /* v register of each packed slot */
+    const uint32_t        *indices;     /* triangle list over the vertices */
+    uint32_t               nindices;
+    const uint32_t       (*program)[4]; /* program memory                  */
+    uint32_t               nslots, start;
+    uint64_t               program_hash;
+    const float          (*constants)[4]; /* c[0..191]                     */
+    float                  aa_sx, aa_sy;
+    const Nv2aRenderState *state;
+    const Nv2aPixelState  *pixel;
+} Nv2aBatchVsh;
+
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
      * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
@@ -204,6 +228,9 @@ typedef struct {
                  uint32_t dy, uint32_t w, uint32_t h, uint32_t bpp);
     void (*present)(uint32_t surface_va, uint32_t pitch, uint32_t width,
                     uint32_t height, uint32_t aa_sx, uint32_t aa_sy);
+    /* Optional: run vertex programs on the GPU (Nv2aBatchVsh). Returns 1 if
+     * drawn; 0 sends the batch down the CPU path (draw_xf) instead. */
+    int  (*draw_vsh)(const Nv2aSurface *s, const Nv2aBatchVsh *b);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
