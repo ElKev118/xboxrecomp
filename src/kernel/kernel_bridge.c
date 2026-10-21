@@ -2252,6 +2252,24 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
 
+    {
+        /* RECOMP_DELAY_LOG=n: the first n delays with their interval and
+         * the guest stack words above them (return addresses). */
+        static int left = -2;
+        if (left == -2) {
+            const char *e = getenv("RECOMP_DELAY_LOG");
+            left = e ? atoi(e) : 0;
+        }
+        if (left > 0 && interval_ptr) {
+            int k;
+            left--;
+            fprintf(stderr, "[DELAY] %lld x100ns alert %u stack:",
+                    (long long)((LARGE_INTEGER *)XBOX_TO_NATIVE(interval_ptr))->QuadPart, alertable);
+            for (k = 0; k < 24; k++)
+                fprintf(stderr, " %08X", BRIDGE_MEM32(g_esp + 4u * (uint32_t)k));
+            fprintf(stderr, "\n");
+        }
+    }
 
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
@@ -2706,18 +2724,36 @@ uint32_t xbox_VblankCount(void)
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    static LARGE_INTEGER freq, next;
+    static long long period;
+    LARGE_INTEGER now;
 
-    if (enabled < 0)
+    if (enabled < 0) {
         enabled = getenv("RECOMP_VBLANK") != NULL;
+        QueryPerformanceFrequency(&freq);
+        {
+            /* RECOMP_VBLANK_HZ: the vblank rate (default NTSC 60). */
+            const char *hz = getenv("RECOMP_VBLANK_HZ");
+            int r = hz ? atoi(hz) : 60;
+            period = freq.QuadPart / (r > 0 ? r : 60);
+        }
+    }
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
+    /* A steady 60 Hz from the performance counter, each vblank one period
+     * after the last. It was "GetTickCount64() + 16" checked from a thread
+     * sleeping 10 ms: with the tick count's 15.6 ms steps that came round
+     * every ~31 ms, a 32 Hz vblank, and a title that presents on vblank
+     * (Ghost Recon 2 in play) was held to 30 FPS. */
+    QueryPerformanceCounter(&now);
+    if (!next.QuadPart)
+        next.QuadPart = now.QuadPart;
+    if (now.QuadPart < next.QuadPart)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    next.QuadPart += period;
+    if (now.QuadPart - next.QuadPart > period * 4)   /* far behind: resync */
+        next.QuadPart = now.QuadPart + period;
     InterlockedIncrement(&g_vblank_total);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
@@ -3019,11 +3055,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    /* 1 ms timer resolution: the vblank must be seen within a millisecond
+     * or two of its time, and Sleep(10) at the default resolution is 15.6. */
+    timeBeginPeriod(1);
     for (;;) {
         long long now;
         int i;
 
-        Sleep(10);
+        Sleep(1);
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();

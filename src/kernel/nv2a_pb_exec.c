@@ -943,6 +943,36 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     uint32_t x, y;
     int ok = 1;
 
+    /* 32-bit ARGB, the formats a title rewrites every frame (GR2's colour-
+     * grade strip and HUD textures): already A8R8G8B8 in memory, so only
+     * the texel order changes. Texel by texel through sample_texture this
+     * was a tenth of the pushbuffer thread. */
+    if (tex->color == 0x06 || tex->color == 0x07 || tex->color == 0x12 || tex->color == 0x1E) {
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        int swz = tex->color == 0x06 || tex->color == 0x07;
+        uint32_t w = tex->width, h = tex->height;
+        uint32_t pitch = swz ? w * 4u : tex->pitch;
+        uint64_t bytes = swz ? (uint64_t)w * h * 4u
+                             : (uint64_t)pitch * (h ? h - 1 : 0) + (uint64_t)w * 4u;
+        int pow2 = w && h && !(w & (w - 1)) && !(h & (h - 1));
+        if (tex->offset && (!swz || pow2) && pitch >= w * 4u
+            && guest_span_ok(tex->offset, (uint32_t)bytes)) {
+            const uint8_t *src = mem + tex->offset;
+            if (swz) {
+                xbox_unswizzle_rect(argb_out, src, w, h, 4);
+            } else {
+                for (y = 0; y < h; y++)
+                    memcpy(argb_out + (size_t)y * w, src + (size_t)y * pitch, (size_t)w * 4u);
+            }
+            if (tex->color == 0x07 || tex->color == 0x1E) {        /* X8: opaque */
+                size_t k, n = (size_t)w * h;
+                for (k = 0; k < n; k++)
+                    argb_out[k] |= 0xFF000000u;
+            }
+            return 1;
+        }
+    }
+
     s_gpu.texs[0].offset = tex->offset;
     s_gpu.texs[0].width  = tex->width;
     s_gpu.texs[0].height = tex->height;
