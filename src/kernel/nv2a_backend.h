@@ -207,6 +207,27 @@ typedef struct {
     float                  aa_sx, aa_sy;
     const Nv2aRenderState *state;
     const Nv2aPixelState  *pixel;
+    /* Raw path (raw != 0): instead of `inputs`, the guest's own vertex
+     * bytes for indices base..base+nverts-1, one span per stream, for the
+     * back end to bind as vertex buffers and let its vertex input decode.
+     * `indices` are then rebased (index - base). Attributes with no array
+     * read a constant (imm). Types are NV097's: 0 D3DCOLOR (B,G,R,A bytes),
+     * 1 short normalised, 2 float, 4 unsigned byte normalised, 5 short,
+     * 6 packed 11:11:10 normal (decoded by the shader). */
+    uint32_t               raw;
+    uint32_t               nstreams;
+    struct {
+        const uint8_t     *data;        /* first byte of element `base`     */
+        uint32_t           bytes;
+        uint32_t           stride;
+    } stream[16];
+    uint32_t               nattrs;
+    struct {
+        uint8_t            reg, stream, type, size;
+        uint32_t           offset;      /* within the stream's element      */
+    } attr[16];
+    uint32_t               imm_mask;    /* v registers read as imm[reg]     */
+    float                  imm[16][4];
 } Nv2aBatchVsh;
 
 typedef struct {

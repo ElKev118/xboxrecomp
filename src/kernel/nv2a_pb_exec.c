@@ -3079,11 +3079,117 @@ static uint32_t prim_triangles(uint32_t n, uint32_t *tri)
     return k;
 }
 
+/* RECOMP_VK_RAW_VERTS=0: always fetch attributes on the CPU (dedup path). */
+static int raw_verts_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_RAW_VERTS");
+        on = !e || atoi(e) != 0;
+    }
+    return on;
+}
+
+/* Fill b's raw part: the guest's vertex bytes for the index range the batch
+ * uses, grouped into streams, and the triangle list rebased. Returns 0 when
+ * the batch does not fit (sparse indices, a format with no direct vertex
+ * format, an address outside guest memory): the caller fetches on the CPU. */
+static int build_raw_batch(Nv2aBatchVsh *b, const uint8_t *regs, uint32_t ni,
+                           uint32_t *tri, uint32_t ntri, const uint32_t *pos)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t n = s_gpu.idx_count, lo = 0xFFFFFFFFu, hi = 0, i, k;
+    uint32_t sbase[16], send[16];
+
+    for (i = 0; i < n; i++) {
+        uint32_t v = s_gpu.idx[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    if (lo > hi || hi - lo > n * 4u + 4096u)
+        return 0;
+    b->raw = 1;
+    b->nstreams = 0;
+    b->nattrs = 0;
+    b->imm_mask = 0;
+    for (k = 0; k < ni; k++) {
+        uint32_t r = regs[k], sidx;
+        const VertexAttr *a = &s_gpu.attr[r];
+        if (!a->size || !a->stride) {
+            /* No array: the value last set with SET_VERTEX_DATA*. */
+            b->imm_mask |= 1u << r;
+            if (r < NV_VERTEX_ATTRS)
+                memcpy(b->imm[r], s_gpu.imm_attr[r], sizeof b->imm[r]);
+            else {
+                b->imm[r][0] = b->imm[r][1] = b->imm[r][2] = 0.0f;
+                b->imm[r][3] = 1.0f;
+            }
+            continue;
+        }
+        if (a->type != 0 && a->type != 1 && a->type != 2 && a->type != 4
+            && a->type != 5 && a->type != 6)
+            return 0;
+        if (!s_gpu.inline_active && !a->offset)
+            return 0;
+        /* The stream this attribute is interleaved in: same stride, within
+         * one element of the stream's first attribute. */
+        for (sidx = 0; sidx < b->nstreams; sidx++)
+            if (b->stream[sidx].stride == a->stride
+                && a->offset + a->stride > sbase[sidx] && a->offset < sbase[sidx] + a->stride)
+                break;
+        if (sidx == b->nstreams) {
+            if (b->nstreams >= 16)
+                return 0;
+            b->stream[sidx].stride = a->stride;
+            sbase[sidx] = a->offset;
+            send[sidx] = a->offset;
+            b->nstreams++;
+        }
+        if (a->offset < sbase[sidx]) {
+            /* An earlier attribute of the same element: rebase the stream. */
+            uint32_t d = sbase[sidx] - a->offset, j;
+            for (j = 0; j < b->nattrs; j++)
+                if (b->attr[j].stream == sidx)
+                    b->attr[j].offset += d;
+            sbase[sidx] = a->offset;
+        }
+        if (a->offset + attr_elem_bytes(a) > send[sidx])
+            send[sidx] = a->offset + attr_elem_bytes(a);
+        b->attr[b->nattrs].reg = (uint8_t)r;
+        b->attr[b->nattrs].stream = (uint8_t)sidx;
+        b->attr[b->nattrs].type = (uint8_t)a->type;
+        b->attr[b->nattrs].size = (uint8_t)(a->size < 4 ? a->size : 4);
+        b->attr[b->nattrs].offset = a->offset - sbase[sidx];
+        b->nattrs++;
+    }
+    for (k = 0; k < b->nstreams; k++) {
+        uint64_t start = (uint64_t)sbase[k] + (uint64_t)lo * b->stream[k].stride;
+        uint64_t bytes = (uint64_t)(hi - lo) * b->stream[k].stride + (send[k] - sbase[k]);
+        if (bytes > (32u << 20))
+            return 0;
+        if (s_gpu.inline_active) {
+            if (start + bytes > (uint64_t)s_gpu.inline_count * 4)
+                return 0;
+            b->stream[k].data = (const uint8_t *)s_gpu.inline_buf + start;
+        } else {
+            if (!guest_span_ok(start, (uint32_t)bytes))
+                return 0;
+            b->stream[k].data = mem + start;
+        }
+        b->stream[k].bytes = (uint32_t)bytes;
+    }
+    for (i = 0; i < ntri; i++)
+        tri[i] = s_gpu.idx[pos[i]] - lo;
+    b->nverts = hi - lo + 1;
+    return 1;
+}
+
 /* Returns 1 when the back end drew the batch with its own vertex program. */
 static int raster_batch_gpu_vsh(void)
 {
     static float    *inputs;           /* NV_MAX_INDICES * 16 vec4s */
     static uint32_t *tri, *slot_of;    /* triangle positions; position -> vertex */
+    static uint32_t *tpos;             /* raw path: triangle corners as positions */
     static uint32_t *hkey, *hval, *hgen, hsize, gen;
     static Nv2aPixelState px;
     Nv2aSurface surf;
@@ -3109,12 +3215,43 @@ static int raster_batch_gpu_vsh(void)
         hkey = (uint32_t *)malloc(sizeof(uint32_t) * hsize);
         hval = (uint32_t *)malloc(sizeof(uint32_t) * hsize);
         hgen = (uint32_t *)calloc(hsize, sizeof(uint32_t));
-        if (!inputs || !tri || !slot_of || !hkey || !hval || !hgen)
+        tpos = (uint32_t *)malloc(sizeof(uint32_t) * NV_MAX_INDICES * 6);
+        if (!inputs || !tri || !slot_of || !hkey || !hval || !hgen || !tpos)
             return 0;
     }
     for (a = 0; a < 16; a++)
         if (info.inputs & (1u << a))
             regs[ni++] = (uint8_t)a;
+
+    current_surface(&surf);
+    current_render_state(&rs);
+    current_pixel_state(&px);
+    memset(&b, 0, sizeof b);
+    b.program = prog;
+    b.nslots = NV2A_VSH_SLOTS;
+    b.start = start;
+    b.program_hash = info.hash;
+    b.constants = nv2a_vsh_constants();
+    b.aa_sx = s_gpu.aa_sx;
+    b.aa_sy = s_gpu.aa_sy;
+    b.state = &rs;
+    b.pixel = &px;
+    b.ninputs = ni;
+    memcpy(b.input_reg, regs, sizeof regs);
+
+    /* Raw: the guest's vertex bytes straight to the back end. */
+    if (raw_verts_enabled()) {
+        ntri = prim_triangles(n, tpos);        /* positions, rebased below */
+        if (!ntri)
+            return 1;
+        if (build_raw_batch(&b, regs, ni, tri, ntri, tpos)) {
+            b.indices = tri;
+            b.nindices = ntri;
+            if (s_backend->draw_vsh(&surf, &b))
+                goto drawn;
+        }
+        b.raw = 0;
+    }
 
     /* Distinct vertices: indexed batches name the same vertex many times,
      * and the program then runs once per vertex, not once per corner. */
@@ -3158,27 +3295,13 @@ static int raster_batch_gpu_vsh(void)
     for (i = 0; i < ntri; i++)
         tri[i] = slot_of[tri[i]];
 
-    current_surface(&surf);
-    current_render_state(&rs);
-    current_pixel_state(&px);
-    memset(&b, 0, sizeof b);
     b.inputs = inputs;
     b.nverts = nv;
-    b.ninputs = ni;
-    memcpy(b.input_reg, regs, sizeof regs);
     b.indices = tri;
     b.nindices = ntri;
-    b.program = prog;
-    b.nslots = NV2A_VSH_SLOTS;
-    b.start = start;
-    b.program_hash = info.hash;
-    b.constants = nv2a_vsh_constants();
-    b.aa_sx = s_gpu.aa_sx;
-    b.aa_sy = s_gpu.aa_sy;
-    b.state = &rs;
-    b.pixel = &px;
     if (!s_backend->draw_vsh(&surf, &b))
         return 0;
+drawn:
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     s_gpu.tris_drawn += ntri / 3;
