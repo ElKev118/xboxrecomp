@@ -38,6 +38,11 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    /* Origin of the clip rectangle (SET_SURFACE_CLIP_HORIZONTAL/VERTICAL low
+     * halves), real pixels. Positions stay absolute: a title confining a draw
+     * to a box (GR2's Equipment Setup weapon slots, 102x45 at (270,166))
+     * moves the clip, not the coordinates, so the box is a scissor. */
+    uint32_t clip_x, clip_y;
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
@@ -90,6 +95,9 @@ typedef struct {
      * clear's SET_ZSTENCIL_CLEAR_VALUE keeps the depth (low 16 bits for Z16,
      * top 24 for Z24S8). */
     uint32_t zeta_format, z_float;
+    /* SET_CLEAR_RECT_HORIZONTAL/VERTICAL: the inclusive rectangle a
+     * CLEAR_SURFACE fills (xemu pgraph clear), real pixels. */
+    uint32_t clear_x0, clear_x1, clear_y0, clear_y1;
 } Nv2aRenderState;
 
 typedef struct {

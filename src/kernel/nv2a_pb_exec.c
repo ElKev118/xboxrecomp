@@ -882,6 +882,8 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    out->clip_x          = s_gpu.clip_x;
+    out->clip_y          = s_gpu.clip_y;
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -920,6 +922,16 @@ static void current_render_state(Nv2aRenderState *r)
     r->poly_offset_bias  = reg_f(0x0388);            /* SET_POLYGON_OFFSET_BIAS */
     r->zeta_format       = (s_gpu.format >> 4) & 0xF; /* SET_SURFACE_FORMAT zeta */
     r->z_float           = (s_reg[0x0290 / 4] >> 12) & 1;
+    {
+        /* SET_CLEAR_RECT_HORIZONTAL / _VERTICAL: min in bits 0-11, max
+         * (inclusive) in 16-27, logical pixels. */
+        uint32_t h = s_reg[0x1D98 / 4], v = s_reg[0x1D9C / 4];
+        uint32_t sx = s_gpu.aa_sx > 1.5f ? 2u : 1u, sy = s_gpu.aa_sy > 1.5f ? 2u : 1u;
+        r->clear_x0 = (h & 0xFFF) * sx;
+        r->clear_x1 = (((h >> 16) & 0xFFF) + 1) * sx - 1;
+        r->clear_y0 = (v & 0xFFF) * sy;
+        r->clear_y1 = (((v >> 16) & 0xFFF) + 1) * sy - 1;
+    }
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
