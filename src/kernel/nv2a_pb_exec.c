@@ -2876,6 +2876,7 @@ static void backend_xf_flush(void)
     px.zmax = px.zeta_format == 1 ? 65535.0f : 16777215.0f;
     px.rc_seen = (uint32_t)s_gpu.rc_seen;
     px.color_format = s_gpu.format & 0xF;
+    px.shadow_func = s_reg[0x1E6C / 4] & 7;
     px.fog_enable = (uint32_t)s_gpu.fog_enable;
     px.fog_mode = s_gpu.fog_mode;
     px.fog_param[0] = s_gpu.fog_param[0];

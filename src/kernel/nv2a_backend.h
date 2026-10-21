@@ -155,6 +155,9 @@ typedef struct {
     /* SET_SURFACE_FORMAT colour field: 4 X8R8G8B8_Z8 / 5 _O8 (alpha
      * written as 0 / 1), 8 A8R8G8B8, 3 R5G6B5, 1/2 X1R5G5B5 ... */
     uint32_t color_format;
+    /* SET_SHADOW_DEPTH_FUNC (0 never .. 7 always): how a stage that samples
+     * a depth texture compares the stored depth with the coordinate's z. */
+    uint32_t shadow_func;
 } Nv2aPixelState;
 
 typedef struct {
