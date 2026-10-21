@@ -1050,8 +1050,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
-                break;
+            /* Keep waiting however long boot takes: giving up (it once did
+             * after 30 s) left a slow boot -- a busy host -- with no
+             * controller for the whole session. */
+            if (++waited == 1500) {
+                fprintf(stderr, "  [OHCI0] driver has not started the "
+                                "controller after 30 s; still waiting\n");
+                fflush(stderr);
+            }
             continue;
         }
         if (!(enable & INTR_MIE))

@@ -915,6 +915,11 @@ static void current_render_state(Nv2aRenderState *r)
     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
+    r->poly_offset_fill  = s_reg[0x0338 / 4];        /* SET_POLY_OFFSET_FILL_ENABLE */
+    r->poly_offset_factor = reg_f(0x0384);           /* SET_POLYGON_OFFSET_SCALE_FACTOR */
+    r->poly_offset_bias  = reg_f(0x0388);            /* SET_POLYGON_OFFSET_BIAS */
+    r->zeta_format       = (s_gpu.format >> 4) & 0xF; /* SET_SURFACE_FORMAT zeta */
+    r->z_float           = (s_reg[0x0290 / 4] >> 12) & 1;
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);

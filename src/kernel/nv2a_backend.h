@@ -80,6 +80,16 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    /* SET_POLY_OFFSET_FILL_ENABLE and SET_POLYGON_OFFSET_SCALE_FACTOR/BIAS:
+     * z += bias + factor * (the triangle's depth slope), in depth units
+     * (0..65535 for Z16) -- how a title keeps a shadow caster from
+     * shadowing itself when its depth is compared with the shadow map. */
+    uint32_t poly_offset_fill;
+    float    poly_offset_factor, poly_offset_bias;
+    /* The depth surface's format (1 Z16, 2 Z24S8) and float flag: where a
+     * clear's SET_ZSTENCIL_CLEAR_VALUE keeps the depth (low 16 bits for Z16,
+     * top 24 for Z24S8). */
+    uint32_t zeta_format, z_float;
 } Nv2aRenderState;
 
 typedef struct {
