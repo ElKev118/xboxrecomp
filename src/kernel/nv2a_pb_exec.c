@@ -3084,7 +3084,7 @@ static int raster_batch_gpu_vsh(void)
 {
     static float    *inputs;           /* NV_MAX_INDICES * 16 vec4s */
     static uint32_t *tri, *slot_of;    /* triangle positions; position -> vertex */
-    static uint32_t *hkey, *hval, hsize;
+    static uint32_t *hkey, *hval, *hgen, hsize, gen;
     static Nv2aPixelState px;
     Nv2aSurface surf;
     Nv2aRenderState rs;
@@ -3108,7 +3108,8 @@ static int raster_batch_gpu_vsh(void)
         hsize = 1u << 18;                      /* >= 2 * NV_MAX_INDICES */
         hkey = (uint32_t *)malloc(sizeof(uint32_t) * hsize);
         hval = (uint32_t *)malloc(sizeof(uint32_t) * hsize);
-        if (!inputs || !tri || !slot_of || !hkey || !hval)
+        hgen = (uint32_t *)calloc(hsize, sizeof(uint32_t));
+        if (!inputs || !tri || !slot_of || !hkey || !hval || !hgen)
             return 0;
     }
     for (a = 0; a < 16; a++)
@@ -3117,15 +3118,22 @@ static int raster_batch_gpu_vsh(void)
 
     /* Distinct vertices: indexed batches name the same vertex many times,
      * and the program then runs once per vertex, not once per corner. */
-    memset(hkey, 0xFF, sizeof(uint32_t) * hsize);
+    /* An entry belongs to this batch only if it carries this batch's
+     * generation: nothing to clear between batches (clearing the table took
+     * a megabyte of memset per draw). */
+    if (++gen == 0) {
+        memset(hgen, 0, sizeof(uint32_t) * hsize);
+        gen = 1;
+    }
     for (i = 0; i < n; i++) {
         uint32_t key = s_gpu.idx[i], h = (key * 2654435761u) & (hsize - 1);
-        while (hkey[h] != 0xFFFFFFFFu && hkey[h] != key)
+        while (hgen[h] == gen && hkey[h] != key)
             h = (h + 1) & (hsize - 1);
-        if (hkey[h] == key) {
+        if (hgen[h] == gen) {
             slot_of[i] = hval[h];
             continue;
         }
+        hgen[h] = gen;
         hkey[h] = key;
         hval[h] = nv;
         slot_of[i] = nv;
