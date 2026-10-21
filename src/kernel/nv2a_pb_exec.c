@@ -3756,8 +3756,12 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         break;
     }
     tex_update_valid(t);
-    if (stage == 0)
-        record_tex_reg(method, param);
+    /* Every stage's raw words: back ends read the format word (border
+     * source, cube), CONTROL0 and the border colour per stage. Recording
+     * only stage 0 left stages 1-3 with zeros -- GR2's shadow passes take
+     * four PCF taps on stages 0-3 with a white border, and taps 1-3 lost
+     * it, so ground outside a soldier's shadow map compared as shadowed. */
+    record_tex_reg(method, param);
 }
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
