@@ -4080,6 +4080,45 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
             draws_at_flip = s_gpu.draws;
         }
+        {
+            /* RECOMP_DUMP_TEX_AT=va,w,h,fmt[,every]: at every <every>-th flip
+             * (default 300) decode guest memory at va as that texture and
+             * write texat_NNNN.bmp -- what the CPU path left there, to set
+             * against the GPU's copy of the same surface. */
+            static int init_ = 0, every = 300;
+            static unsigned va, w, h, fmt, n, shot;
+            if (!init_) {
+                const char *e = getenv("RECOMP_DUMP_TEX_AT");
+                init_ = 1;
+                if (e) sscanf(e, "%x,%u,%u,%x,%d", &va, &w, &h, &fmt, &every);
+                if (every <= 0) every = 300;
+            }
+            if (va && w && h && w * h <= 4096u * 4096u && ++n % (unsigned)every == 0) {
+                Nv2aTexture t;
+                uint32_t *px = (uint32_t *)malloc((size_t)w * h * 4);
+                memset(&t, 0, sizeof t);
+                t.offset = va; t.width = w; t.height = h; t.color = fmt;
+                if (px && nv2a_backend_decode_texture(&t, px)) {
+                    char path[64];
+                    FILE *f;
+                    snprintf(path, sizeof path, "texat_%04u.bmp", shot++);
+                    f = fopen(path, "wb");
+                    if (f) {
+                        uint8_t hdr[54]; uint32_t rp = (4 - (w * 3) % 4) % 4, sz = 54 + (w * 3 + rp) * h, y, x;
+                        static const uint8_t pad[3];
+                        memset(hdr, 0, 54); hdr[0] = 'B'; hdr[1] = 'M'; memcpy(hdr + 2, &sz, 4);
+                        hdr[10] = 54; hdr[14] = 40; memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &h, 4);
+                        hdr[26] = 1; hdr[28] = 24; fwrite(hdr, 1, 54, f);
+                        for (y = h; y-- > 0;) {
+                            for (x = 0; x < w; x++) fwrite(&px[(size_t)y * w + x], 1, 3, f);
+                            fwrite(pad, 1, rp, f);
+                        }
+                        fclose(f);
+                    }
+                }
+                free(px);
+            }
+        }
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
