@@ -190,6 +190,21 @@ static uint32_t *reg_of(OhciController *hc, uint32_t off)
 
 /* ---- register semantics ------------------------------------------------ */
 
+
+/* The USB frame number: one frame per millisecond since the first read,
+ * from the performance counter (16 bits, as HcFmNumber and HCCA hold it). */
+static uint32_t ohci_frame_number(void)
+{
+    static LARGE_INTEGER freq, start;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&start);
+    }
+    QueryPerformanceCounter(&now);
+    return (uint32_t)((now.QuadPart - start.QuadPart) * 1000 / freq.QuadPart) & 0xFFFFu;
+}
+
 static uint64_t ohci_read(void *dev, uint32_t off, int size)
 {
     OhciController *hc = (OhciController *)dev;
@@ -199,13 +214,11 @@ static uint64_t ohci_read(void *dev, uint32_t off, int size)
 
     hc->reads++;
 
-    /* HcFmRemaining and HcFmNumber advance on their own. A driver that waits
-     * for the frame counter to move is waiting for the controller to be
-     * running, and a counter that never changes is a controller that is not.
-     * Derived from the read count rather than a timer: it only has to be
-     * monotonic, and a timer here would need a thread to be worth having. */
+    /* HcFmRemaining and HcFmNumber advance on their own: the frame number
+     * at one per millisecond of real time (ohci_frame_number), the same
+     * value the controller writes to HccaFrameNumber. */
     if (aligned == HcFmNumber)
-        v = (hc->reads >> 3) & 0xFFFFu;
+        v = ohci_frame_number();
     else if (aligned == HcFmRemaining)
         v = (hc->reads * 977u) & 0x3FFFu;
 
@@ -1120,9 +1133,15 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * moves. */
         {
             uint32_t hcca = hc->reg[HcHCCA / 4];
-
-            hc->reg[HcFmNumber / 4] =
-                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
+            /* One frame per millisecond of real time, from the performance
+             * counter. Adding OHCI_TICK_MS a tick assumed the tick lasted
+             * exactly that, and Sleep always runs over (4 ms slept ~5.1): the
+             * frame number ran at 78 % speed. XDK DirectSound reads it as its
+             * millisecond clock (HccaFrameNumber x 48 samples), so the movie
+             * player's audio clock ran 22 % slow -- the picture fell behind
+             * the sound, the stream ran dry, and every refill came later than
+             * the last until the video barely moved. */
+            hc->reg[HcFmNumber / 4] = ohci_frame_number();
             /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)

@@ -170,6 +170,9 @@ static void prof_count(const char *name, uint32_t va)
     g_prof_full = 1;
 }
 
+/* The APU's frame count (32 samples at 48 kHz): a clock the audio logs share. */
+extern unsigned long apu_vp_frames(void);
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
     if (prof_enabled()) { prof_count(name, va); return; }
@@ -178,9 +181,9 @@ void recomp_trace_enter(const char *name, uint32_t va)
      * [esp], and it names the call site, which is the thing a trace of "who
      * reached this" actually needs. Reading a guest stack dump for it works
      * only when the frames above are still live. */
-    fprintf(stderr, "[TRACE] -> %s (0x%08X)  from=%08X esp=%08X eax=%08X "
+    fprintf(stderr, "[TRACE] f=%lu -> %s (0x%08X)  from=%08X esp=%08X eax=%08X "
             "ecx=%08X esi=%08X edi=%08X ebx=%08X\n",
-            name, va,
+            apu_vp_frames(), name, va,
             *(const uint32_t *)((uintptr_t)g_esp + xbox_GetMemoryOffset()),
             g_esp, g_eax, g_ecx, g_esi, g_edi, g_ebx);
 

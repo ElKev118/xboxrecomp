@@ -24,6 +24,24 @@ uint32_t recomp_mmio_read(uint32_t va, int size)
 {
     if (!g_apu_state)
         return 0;
+    {
+        /* RECOMP_APU_READS=1: each register read through here, once, with
+         * the value it gave -- which counters a title polls. */
+        static int on = -1, n;
+        static uint32_t seen[256];
+        if (on < 0)
+            on = getenv("RECOMP_APU_READS") != NULL;
+        if (on && n < 256) {
+            uint32_t key = (va - 0xFE800000u) | ((uint32_t)size << 28), k;
+            for (k = 0; k < (uint32_t)n && seen[k] != key; k++)
+                ;
+            if (k == (uint32_t)n) {
+                seen[n++] = key;
+                fprintf(stderr, "[APU-READ] 0x%05X size %d = 0x%08X\n", va - 0xFE800000u, size,
+                        (uint32_t)mcpx_apu_mmio_read(g_apu_state, va - 0xFE800000u, (unsigned)size));
+            }
+        }
+    }
     return (uint32_t)mcpx_apu_mmio_read(g_apu_state, va - 0xFE800000u, (unsigned)size);
 }
 

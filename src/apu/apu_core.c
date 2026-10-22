@@ -1173,6 +1173,22 @@ static void *mcpx_apu_frame_thread(void *arg)
                     && d->sample_count >= ssl
                     && (sectl & NV_PAPU_SECTL_XCNTMODE)
                            != NV_PAPU_SECTL_XCNTMODE_OFF) {
+                /* RECOMP_APU_SSLSTAT=1: ticks raised, and ticks that found
+                 * the previous one still unacknowledged (merged into it). */
+                static int st = -1;
+                static unsigned raised, merged, last_print;
+                if (st < 0)
+                    st = getenv("RECOMP_APU_SSLSTAT") != NULL;
+                if (st) {
+                    raised++;
+                    if (qatomic_read(&d->regs[NV_PAPU_ISTS]) & NV_PAPU_ISTS_SSLINTSTS)
+                        merged++;
+                    if (raised - last_print >= 200) {
+                        last_print = raised;
+                        fprintf(stderr, "[APU-SSL] ticks %u, merged into a pending one %u\n",
+                                raised, merged);
+                    }
+                }
                 d->sample_count -= ssl;
                 qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
                 d->set_irq = true;

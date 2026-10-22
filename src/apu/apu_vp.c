@@ -187,6 +187,8 @@ static int s_strace = -1;
 static int s_strace_budget = 4000;
 static uint8_t s_strace_dry[MCPX_HW_MAX_VOICES]; /* dry logged since last SSL set */
 static unsigned long s_vp_frames;   /* VP frames run: 1 frame = 32 samples at 48 kHz */
+/* The VP frame count, as a clock other logs can share with this one. */
+unsigned long apu_vp_frames(void) { return s_vp_frames; }
 
 static bool voice_is_stream(MCPXAPUState *d, uint16_t v)
 {
