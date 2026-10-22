@@ -3109,6 +3109,43 @@ static uint32_t prim_triangles(uint32_t n, uint32_t *tri)
     return k;
 }
 
+/* prim_triangles straight to rebased indices (index - lo), for the raw
+ * path: no position list in between, and a triangle list -- the common
+ * case -- is one subtraction loop the compiler can vectorise. */
+static uint32_t raw_triangles(uint32_t n, uint32_t *tri, uint32_t lo)
+{
+    const uint32_t *x = s_gpu.idx;
+    uint32_t i, k = 0;
+
+#define TRI(a, b, c) do { tri[k] = x[a] - lo; tri[k + 1] = x[b] - lo; \
+                          tri[k + 2] = x[c] - lo; k += 3; } while (0)
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        k = n - n % 3;
+        for (i = 0; i < k; i++)
+            tri[i] = x[i] - lo;
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++)
+            if (i & 1) TRI(i + 1, i, i + 2); else TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) TRI(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) { TRI(i, i + 1, i + 2); TRI(i, i + 2, i + 3); }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) { TRI(i, i + 1, i + 3); TRI(i, i + 3, i + 2); }
+        break;
+    default:
+        break;
+    }
+#undef TRI
+    return k;
+}
+
 /* Bumped at every fence release the executor writes: the title may rewrite
  * a buffer the GPU had read only after one (Nv2aBatchVsh.data_gen). */
 static uint32_t s_data_gen = 1;
@@ -3129,16 +3166,16 @@ static int raw_verts_enabled(void)
  * the batch does not fit (sparse indices, a format with no direct vertex
  * format, an address outside guest memory): the caller fetches on the CPU. */
 static int build_raw_batch(Nv2aBatchVsh *b, const uint8_t *regs, uint32_t ni,
-                           uint32_t *tri, uint32_t ntri, const uint32_t *pos)
+                           uint32_t *tri, uint32_t *ntri)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t n = s_gpu.idx_count, lo = 0xFFFFFFFFu, hi = 0, i, k;
     uint32_t sbase[16], send[16];
 
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < n; i++) {                  /* branch-free: vectorises */
         uint32_t v = s_gpu.idx[i];
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
+        lo = v < lo ? v : lo;
+        hi = v > hi ? v : hi;
     }
     if (lo > hi || hi - lo > n * 4u + 4096u)
         return 0;
@@ -3212,8 +3249,7 @@ static int build_raw_batch(Nv2aBatchVsh *b, const uint8_t *regs, uint32_t ni,
         }
         b->stream[k].bytes = (uint32_t)bytes;
     }
-    for (i = 0; i < ntri; i++)
-        tri[i] = s_gpu.idx[pos[i]] - lo;
+    *ntri = raw_triangles(n, tri, lo);
     b->nverts = hi - lo + 1;
     /* Reusable while no fence has been released since -- and only when the
      * fences are this executor's own writes; inline data never. */
@@ -3226,7 +3262,6 @@ static int raster_batch_gpu_vsh(void)
 {
     static float    *inputs;           /* NV_MAX_INDICES * 16 vec4s */
     static uint32_t *tri, *slot_of;    /* triangle positions; position -> vertex */
-    static uint32_t *tpos;             /* raw path: triangle corners as positions */
     static uint32_t *hkey, *hval, *hgen, hsize, gen;
     static Nv2aPixelState px;
     Nv2aSurface surf;
@@ -3252,8 +3287,7 @@ static int raster_batch_gpu_vsh(void)
         hkey = (uint32_t *)malloc(sizeof(uint32_t) * hsize);
         hval = (uint32_t *)malloc(sizeof(uint32_t) * hsize);
         hgen = (uint32_t *)calloc(hsize, sizeof(uint32_t));
-        tpos = (uint32_t *)malloc(sizeof(uint32_t) * NV_MAX_INDICES * 6);
-        if (!inputs || !tri || !slot_of || !hkey || !hval || !hgen || !tpos)
+        if (!inputs || !tri || !slot_of || !hkey || !hval || !hgen)
             return 0;
     }
     for (a = 0; a < 16; a++)
@@ -3278,10 +3312,9 @@ static int raster_batch_gpu_vsh(void)
 
     /* Raw: the guest's vertex bytes straight to the back end. */
     if (raw_verts_enabled()) {
-        ntri = prim_triangles(n, tpos);        /* positions, rebased below */
-        if (!ntri)
-            return 1;
-        if (build_raw_batch(&b, regs, ni, tri, ntri, tpos)) {
+        if (build_raw_batch(&b, regs, ni, tri, &ntri)) {
+            if (!ntri)
+                return 1;                      /* no whole triangle */
             b.indices = tri;
             b.nindices = ntri;
             if (s_backend->draw_vsh(&surf, &b))
