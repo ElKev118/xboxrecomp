@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <mmsystem.h>   /* timeBeginPeriod */
 #include <setjmp.h>
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
@@ -1554,8 +1555,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * up XNet. A live clock is also just the truth -- KeTickCount ticks on
          * hardware whether or not anyone is asleep. GetTickCount() shares the
          * millisecond unit, so the rate matches. */
-        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
+        /* (Now advanced by tick_thread, every millisecond: here it moved
+         * only between pushbuffer walks, and with GetTickCount's 15.6 ms
+         * steps -- see xbox_TimeSinceBoot100ns.) */
 
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
@@ -1586,8 +1588,28 @@ static DWORD WINAPI nv2a_kick_spin_thread(LPVOID param)
     return 0;
 }
 
+/* KeTickCount, advanced every millisecond as on the console, by the one
+ * thread that writes it (two writers could step it back). */
+extern uint32_t xbox_TickCountMs(void);
+static DWORD WINAPI tick_thread(LPVOID unused)
+{
+    volatile uint32_t *tick = (volatile uint32_t *)
+        ((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) + g_memory_offset);
+    (void)unused;
+    timeBeginPeriod(1);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    for (;;) {
+        *tick = xbox_TickCountMs();
+        Sleep(1);
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
+    *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                           + g_memory_offset) = xbox_TickCountMs();
+    CloseHandle(CreateThread(NULL, 0, tick_thread, NULL, 0, NULL));
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;

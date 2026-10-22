@@ -849,6 +849,9 @@ BOOLEAN __stdcall xbox_KeConnectInterrupt(PXBOX_KINTERRUPT Interrupt);
 
 /* KeTickCount - exported as a data pointer, not a function */
 extern volatile ULONG xbox_KeTickCount;
+/* Time since boot from the performance counter (see kernel_hal.c). */
+ULONGLONG xbox_TimeSinceBoot100ns(void);
+uint32_t  xbox_TickCountMs(void);
 
 /* ============================================================================
  * Xbox Identity & Stubs (kernel_xbox.c)

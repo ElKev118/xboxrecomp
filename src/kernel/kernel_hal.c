@@ -371,10 +371,52 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 
 volatile ULONG xbox_KeTickCount = 0;
 
+/* Time since boot, in NT 100 ns units, from the performance counter.
+ *
+ * Every clock the title reads that counts from boot -- KeTickCount (ms),
+ * KeInterruptTime / KeQueryInterruptTime (100 ns) -- came from GetTickCount,
+ * which moves in steps of about 15.6 ms. The console's advance every
+ * millisecond or finer. Above ~64 frames a second that made every other
+ * frame see no time pass at all, and Ghost Recon 2's characters then drew
+ * every other frame without the hand on the rifle and with the body between
+ * two poses (unlimited frame rate: flickers; 60: fine; 30: fine).
+ *
+ * Anchored to GetTickCount64 at the first call so the values stay where they
+ * were; whole seconds and the remainder are scaled apart (no overflow). */
+ULONGLONG xbox_TimeSinceBoot100ns(void)
+{
+    static LONGLONG freq, start;
+    static ULONGLONG anchor;
+    LARGE_INTEGER now;
+    LONGLONG d;
+
+    if (!freq) {
+        LARGE_INTEGER f, s;
+        ULONGLONG a = (ULONGLONG)GetTickCount64() * 10000ull;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&s);
+        anchor = a;
+        start = s.QuadPart;
+        MemoryBarrier();
+        freq = f.QuadPart ? f.QuadPart : 1;
+    }
+    QueryPerformanceCounter(&now);
+    d = now.QuadPart - start;
+    if (d < 0)
+        d = 0;
+    return anchor + (ULONGLONG)(d / freq) * 10000000ull
+         + (ULONGLONG)(d % freq) * 10000000ull / (ULONGLONG)freq;
+}
+
+uint32_t xbox_TickCountMs(void)
+{
+    return (uint32_t)(xbox_TimeSinceBoot100ns() / 10000ull);
+}
+
 /* Call this periodically or on-demand to update KeTickCount */
 static void xbox_update_tick_count(void)
 {
-    xbox_KeTickCount = GetTickCount();
+    xbox_KeTickCount = xbox_TickCountMs();
 }
 
 /* ============================================================================
@@ -1075,7 +1117,7 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
      * scale by 10,000. Resolution is coarser than the real kernel's, but it is
      * monotonic, which is the property callers actually depend on.
      */
-    return (ULONGLONG)GetTickCount64() * 10000ULL;
+    return xbox_TimeSinceBoot100ns();     /* see there: 15.6 ms steps broke animation */
 }
 
 /* ============================================================================

@@ -78,6 +78,14 @@ static int pb_walk_enabled(void)
             ack_read = 1;
             if (e && atoi(e))
                 s_ack_mask = 0xFFu;
+            /* RECOMP_NV2A_SYNC_KICKS=1 (diagnostic): never answer a kickoff
+             * mid-walk, only once the walk has caught up with PUT (the poll
+             * loop's own answer), so the title waits at each kickoff for the
+             * GPU to have done everything before it -- a GPU with no lag, to
+             * tell an executor that runs behind from a title bug. */
+            e = getenv("RECOMP_NV2A_SYNC_KICKS");
+            if (e && atoi(e))
+                s_ack_mask = 0xFFFFFFFFu;
         }
     }
     return s_exec_enabled || s_scan_enabled;
