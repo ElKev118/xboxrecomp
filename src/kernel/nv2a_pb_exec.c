@@ -4199,6 +4199,28 @@ int nv2a_pb_exec_bulk_inc(uint32_t method, const uint32_t *params, uint32_t n)
 {
     uint32_t i;
 
+    /* The vertex array offsets and formats: 32 words a draw, each one a
+     * pass through the whole dispatch. Same effect as the default case. */
+    if (n && method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
+        && method + 4 * n <= NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4
+        && s_ftrace != 2) {
+        for (i = 0; i < n; i++) {
+            uint32_t m = method + 4 * i, param = params[i];
+            s_reg[m / 4] = param;
+            if (m < NV097_SET_VERTEX_DATA_ARRAY_FORMAT) {
+                s_gpu.attr[(m - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].offset =
+                    dma_resolve(param);
+            } else {
+                VertexAttr *a = &s_gpu.attr[(m - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
+                a->type   =  param        & 0x0F;
+                a->size   = (param >> 4)  & 0x0F;
+                if (a->size == 7)                   /* SIZE_3W */
+                    a->size = 3;
+                a->stride = (param >> 8)  & 0xFF;
+            }
+        }
+        return 1;
+    }
     if (!n || method < 0x0B00 || method + 4 * n > 0x0C00
         || (method < 0x0B80 && method + 4 * n > 0x0B80) || s_ftrace == 2)
         return 0;
