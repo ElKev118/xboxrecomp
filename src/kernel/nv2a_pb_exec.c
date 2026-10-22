@@ -4111,6 +4111,8 @@ int nv2a_pb_exec_bulk(uint32_t method, const uint32_t *params, uint32_t n)
 
     if (!s_gpu.prim || !n)
         return 0;
+    if (method >= 0x0B00 && method < 0x0C00)
+        return 0;                               /* incrementing only, below */
     switch (method) {
     case NV097_ARRAY_ELEMENT16:
         k = s_gpu.idx_count;
@@ -4139,6 +4141,28 @@ int nv2a_pb_exec_bulk(uint32_t method, const uint32_t *params, uint32_t n)
         return 0;
     }
     s_reg[(method & 0x1FFCu) / 4] = params[n - 1];
+    return 1;
+}
+
+/* An incrementing run of n subchannel-0 parameters starting at method, when
+ * it is a vertex-program or constant upload (TRANSFORM_PROGRAM/_CONSTANT):
+ * the loader takes the words in order whatever the method index, and the
+ * run is dozens of words per draw. Returns 0 to go word by word instead. */
+int nv2a_pb_exec_bulk_inc(uint32_t method, const uint32_t *params, uint32_t n)
+{
+    uint32_t i;
+
+    if (!n || method < 0x0B00 || method + 4 * n > 0x0C00
+        || (method < 0x0B80 && method + 4 * n > 0x0B80) || s_ftrace == 2)
+        return 0;
+    for (i = 0; i < n; i++)
+        s_reg[(method & 0x1FFCu) / 4 + i] = params[i];
+    if (method < 0x0B80)
+        for (i = 0; i < n; i++)
+            nv2a_vsh_program_word(params[i]);
+    else
+        for (i = 0; i < n; i++)
+            nv2a_vsh_constant_word(params[i]);
     return 1;
 }
 

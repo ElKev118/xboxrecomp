@@ -18,29 +18,45 @@ HEADER_DIR = Path(__file__).resolve().parents[2] / "templates" / "runtime"
 BASE = 0x10000
 
 
+def _body(lines, names=()):
+    """_localize_regs output without the per-function declarations."""
+    out = _localize_regs(["{"] + lines, set(names))
+    return [l for l in out[1:] if not l.startswith(("#", "    uint32_t l_",
+                                                     "    RecompXmm l_",
+                                                     "    const uintptr_t l_mem"))]
+
+
+def test_only_named_registers_are_copied():
+    out = _localize_regs(["{", "    eax = MEM32(esp + 4); xmm1 = xmm0; /* ecx */"], set())
+    assert "    uint32_t l_eax = g_eax, l_esp = g_esp;" in out
+    assert "    RecompXmm l_xmm0 = g_xmm0, l_xmm1 = g_xmm1;" in out
+    assert ("#define RECOMP_REGS_OUT() (g_eax = l_eax, g_esp = l_esp, "
+            "g_xmm0 = l_xmm0, g_xmm1 = l_xmm1, (void)0)") in out
+    assert not any("l_ecx" in l for l in out)          # named only in a comment
+    assert out[-2:] == ["#undef RECOMP_REGS_OUT", "#undef RECOMP_REGS_IN"]
+
+
 def test_direct_call_is_published_and_reloaded():
-    out = _localize_regs(["{", "    PUSH32(esp, 1); sub_00012345(); /* x */"], set())
-    assert out[1] == "    RECOMP_REGS_DECL"
-    assert ("RECOMP_REGS_OUT(); sub_00012345(); RECOMP_REGS_IN();" in out[2]
-            and out[2].endswith("/* x */"))
+    body = _body(["    PUSH32(esp, 1); sub_00012345(); /* x */"])
+    assert ("RECOMP_REGS_OUT(); sub_00012345(); RECOMP_REGS_IN();" in body[0]
+            and body[0].endswith("/* x */"))
 
 
 def test_tail_call_returns_the_callee_registers():
-    out = _localize_regs(["{", "    g_seh_ebp = ebp; sub_00012345(); return; /* tail jmp */"], set())
-    assert "RECOMP_REGS_OUT(); sub_00012345(); return;" in out[2]
-    assert "RECOMP_REGS_IN" not in out[2] and "RECOMP_RETURN" not in out[2]
+    body = _body(["    g_seh_ebp = ebp; sub_00012345(); return; /* tail jmp */"])
+    assert "RECOMP_REGS_OUT(); sub_00012345(); return;" in body[0]
+    assert "RECOMP_REGS_IN" not in body[0] and "RECOMP_RETURN" not in body[0]
 
 
 def test_return_publishes():
-    out = _localize_regs(["{", "    esp += 4; return; /* ret */",
-                          "    if (x) return;"], set())
-    assert out[2] == "    esp += 4; RECOMP_RETURN(); /* ret */"
-    assert out[3] == "    if (x) RECOMP_RETURN();"
+    body = _body(["    esp += 4; return; /* ret */", "    if (x) return;"])
+    assert body[0] == "    esp += 4; RECOMP_RETURN(); /* ret */"
+    assert body[1] == "    if (x) RECOMP_RETURN();"
 
 
 def test_named_callee_and_comments_untouched():
-    out = _localize_regs(["{", "    memset_00011111(); /* return; */"], {"memset_00011111"})
-    assert out[2] == "    RECOMP_REGS_OUT(); memset_00011111(); RECOMP_REGS_IN(); /* return; */"
+    body = _body(["    memset_00011111(); /* return; */"], {"memset_00011111"})
+    assert body[0] == "    RECOMP_REGS_OUT(); memset_00011111(); RECOMP_REGS_IN(); /* return; */"
 
 
 def test_setjmp_landing_reloads_and_longjmp_publishes():
@@ -48,10 +64,10 @@ def test_setjmp_landing_reloads_and_longjmp_publishes():
           "{ ebp = g_seh_ebp; eax = (uint32_t)_sjv; } else { PUSH32(esp, 1u); "
           "sub_003B9484(); } }")
     lj = "    if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4))) { sub_003B9484(); }"
-    out = _localize_regs(["{", sj, lj], set())
-    assert "if (_sjv) { RECOMP_REGS_IN(); ebp = g_seh_ebp;" in out[2]
-    assert "RECOMP_REGS_OUT(); sub_003B9484(); RECOMP_REGS_IN();" in out[2]
-    assert out[3].startswith("    RECOMP_REGS_OUT(); if (!recomp_guest_longjmp(")
+    body = _body([sj, lj])
+    assert "if (_sjv) { RECOMP_REGS_IN(); ebp = g_seh_ebp;" in body[0]
+    assert "RECOMP_REGS_OUT(); sub_003B9484(); RECOMP_REGS_IN();" in body[0]
+    assert body[1].startswith("    RECOMP_REGS_OUT(); if (!recomp_guest_longjmp(")
 
 
 # caller (0x10000): mov ecx,5; push 37; call 0x10100; inc eax; ret
@@ -76,6 +92,7 @@ HARNESS = r"""
 #include <string.h>
 RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
 RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
+RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3, g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 ptrdiff_t g_xbox_mem_offset;
 static uint8_t ram[0x10000];
 static void push(uint32_t v) { g_esp -= 4; memcpy(ram + g_esp, &v, 4); }
@@ -115,7 +132,7 @@ def test_registers_cross_calls_in_local_mode(monkeypatch):
           BASE + 0x200: {"end": BASE + 0x20A, "size": 10}}
     tr = FunctionTranslator(image, db)
     bodies = "\n".join(tr.translate_function(a, db[a]) for a in sorted(db))
-    assert "RECOMP_REGS_DECL" in bodies
+    assert "l_mem" in bodies
     with tempfile.TemporaryDirectory(prefix="recomp-localregs-") as tmp:
         src, exe = Path(tmp) / "t.c", Path(tmp) / "t.exe"
         src.write_text(HARNESS.replace("BODIES", bodies), encoding="utf-8")

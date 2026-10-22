@@ -1572,13 +1572,15 @@ void recomp_unimpl(const char *text, uint32_t va);
  * three or four host instructions of bookkeeping per guest instruction.
  * Ghost Recon 2's main thread spent most of its time there.
  *
- * In this mode each generated function copies the seven registers and the
- * memory base into locals on entry (RECOMP_REGS_DECL), which the compiler
+ * In this mode each generated function copies the registers it names (GPRs
+ * and xmm0-7) and the memory base into locals on entry, which the compiler
  * keeps in host registers, and hands them back only where something else
  * can look: before every call and return (RECOMP_REGS_OUT) and after every
- * call (RECOMP_REGS_IN). ebp was already a local. The call macros wrap
- * their _G (global-register) forms; the lifter wraps direct calls, returns,
- * setjmp and longjmp.
+ * call (RECOMP_REGS_IN). The lifter defines those two per function, for
+ * just that set: a register the function never names is never written
+ * here, so its global stays current by itself. ebp was already a local.
+ * The call macros below wrap their _G (global-register) forms; the lifter
+ * wraps direct calls, returns, setjmp and longjmp.
  * ================================================================ */
 #if defined(RECOMP_GENERATED_CODE) && defined(RECOMP_LOCAL_REGS)
 #undef eax
@@ -1595,17 +1597,24 @@ void recomp_unimpl(const char *text, uint32_t va);
 #define ebx l_ebx
 #define esi l_esi
 #define edi l_edi
+#undef xmm0
+#undef xmm1
+#undef xmm2
+#undef xmm3
+#undef xmm4
+#undef xmm5
+#undef xmm6
+#undef xmm7
+#define xmm0 l_xmm0
+#define xmm1 l_xmm1
+#define xmm2 l_xmm2
+#define xmm3 l_xmm3
+#define xmm4 l_xmm4
+#define xmm5 l_xmm5
+#define xmm6 l_xmm6
+#define xmm7 l_xmm7
 #undef XBOX_PTR
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + l_mem)
-#define RECOMP_REGS_DECL \
-    uint32_t l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_esp = g_esp, \
-             l_ebx = g_ebx, l_esi = g_esi, l_edi = g_edi; \
-    const uintptr_t l_mem = (uintptr_t)g_xbox_mem_offset; \
-    (void)l_mem;
-#define RECOMP_REGS_OUT() (g_eax = l_eax, g_ecx = l_ecx, g_edx = l_edx, \
-    g_esp = l_esp, g_ebx = l_ebx, g_esi = l_esi, g_edi = l_edi, (void)0)
-#define RECOMP_REGS_IN() (l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, \
-    l_esp = g_esp, l_ebx = g_ebx, l_esi = g_esi, l_edi = g_edi, (void)0)
 #define RECOMP_RETURN() do { RECOMP_REGS_OUT(); return; } while (0)
 #define RECOMP_REGS_CALL(stmt) do { RECOMP_REGS_OUT(); stmt; RECOMP_REGS_IN(); } while (0)
 #define RECOMP_ABI_CALL(va, fn) RECOMP_REGS_CALL(RECOMP_ABI_CALL_G(va, fn))
@@ -1625,10 +1634,9 @@ void recomp_unimpl(const char *text, uint32_t va);
 #define RECOMP_TRACE_ESP(name, tag) (RECOMP_REGS_OUT(), recomp_trace_esp((name), (tag)))
 #define RECOMP_UNIMPL(_text, _va) (RECOMP_REGS_OUT(), recomp_unimpl((_text), (_va)))
 #else
-#define RECOMP_REGS_DECL
 #define RECOMP_REGS_OUT() ((void)0)
 #define RECOMP_REGS_IN() ((void)0)
-#define RECOMP_RETURN() return
+#define RECOMP_RETURN() do { return; } while (0)
 #define RECOMP_ABI_CALL(va, fn) RECOMP_ABI_CALL_G(va, fn)
 #define RECOMP_ICALL(a) RECOMP_ICALL_G(a)
 #define RECOMP_ICALL_SAFE(a, s) RECOMP_ICALL_SAFE_G(a, s)

@@ -323,18 +323,24 @@ def _fixup_icall_esp_save(lines):
 # default; --global-regs turns it off for comparison runs.
 LOCAL_REGS = True
 
-_LR_DIRECT_CALL = None
+_LR_REG_NAME = None
 _LR_RETURN = None
+
+
+_LR_GPRS = ("eax", "ecx", "edx", "esp", "ebx", "esi", "edi")
+_LR_XMMS = tuple(f"xmm{i}" for i in range(8))
 
 
 def _localize_regs(lines, call_names):
     """Rewrite a finished function body for RECOMP_LOCAL_REGS.
 
-    The registers become locals (declared by RECOMP_REGS_DECL after the
-    opening brace), so the globals have to be current wherever anything
-    outside this function can read them, and the locals reloaded wherever
-    anything outside can have changed them. The call macros do that
-    themselves; what the lifter writes as plain C is handled here:
+    The registers this function names become locals, so the globals have to
+    be current wherever anything outside this function can read them, and the
+    locals reloaded wherever anything outside can have changed them. Only the
+    registers the body names are copied: the others are never written here,
+    so their globals stay current on their own. RECOMP_REGS_OUT/IN are
+    defined per function for that set (the call macros in recomp_types.h
+    expand them); what the lifter writes as plain C is handled here:
 
       NAME(); return;   a tail call: publish, call, return -- the callee's
                         registers are the result, so nothing is written after
@@ -344,9 +350,11 @@ def _localize_regs(lines, call_names):
       longjmp           publish first: it reads the guest state
     """
     import re
-    global _LR_DIRECT_CALL, _LR_RETURN
+    global _LR_REG_NAME, _LR_RETURN
     if _LR_RETURN is None:
         _LR_RETURN = re.compile(r'\breturn;')
+        _LR_REG_NAME = re.compile(
+            r'\b(' + "|".join(_LR_GPRS + _LR_XMMS) + r')\b')
     names = "|".join(sorted((re.escape(n) for n in call_names), key=len,
                             reverse=True))
     direct = re.compile(r'\b(sub_[0-9A-Fa-f]{8}\w*' + ("|" + names if names else "")
@@ -357,15 +365,31 @@ def _localize_regs(lines, call_names):
             return f"RECOMP_REGS_OUT(); {m.group(1)}(); RECOMP_TAIL_RETURN;"
         return f"RECOMP_REGS_OUT(); {m.group(1)}(); RECOMP_REGS_IN();"
 
-    out = []
-    opened = False
-    for line in lines:
-        if not opened:
-            out.append(line)
-            if line == "{":
-                out.append("    RECOMP_REGS_DECL")
-                opened = True
+    try:
+        start = lines.index("{") + 1
+    except ValueError:
+        return lines
+    used = set()
+    for line in lines[start:]:
+        if line.lstrip().startswith("#"):
             continue
+        used.update(_LR_REG_NAME.findall(re.sub(r"/\*.*?\*/", "", line)))
+    gprs = [r for r in _LR_GPRS if r in used]
+    xmms = [r for r in _LR_XMMS if r in used]
+    regs = gprs + xmms
+    decl = []
+    if gprs:
+        decl.append("    uint32_t " + ", ".join(f"l_{r} = g_{r}" for r in gprs) + ";")
+    if xmms:
+        decl.append("    RecompXmm " + ", ".join(f"l_{r} = g_{r}" for r in xmms) + ";")
+    decl.append("    const uintptr_t l_mem = (uintptr_t)g_xbox_mem_offset; (void)l_mem;")
+    decl.append("#define RECOMP_REGS_OUT() (" + "".join(f"g_{r} = l_{r}, " for r in regs)
+                + "(void)0)")
+    decl.append("#define RECOMP_REGS_IN() (" + "".join(f"l_{r} = g_{r}, " for r in regs)
+                + "(void)0)")
+
+    out = lines[:start] + decl
+    for line in lines[start:]:
         code, sep, comment = line.partition("/*")
         if "();" in code or "return;" in code or "setjmp" in code:
             code = direct.sub(call_sub, code)
@@ -376,6 +400,8 @@ def _localize_regs(lines, call_names):
                                 "RECOMP_REGS_OUT(); if (!recomp_guest_longjmp(")
             line = code + sep + comment
         out.append(line)
+    out.append("#undef RECOMP_REGS_OUT")
+    out.append("#undef RECOMP_REGS_IN")
     return out
 
 

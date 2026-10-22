@@ -47,6 +47,7 @@ static uint32_t s_tot_calls;
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern int nv2a_pb_exec_bulk(uint32_t method, const uint32_t *params, uint32_t n);
+extern int nv2a_pb_exec_bulk_inc(uint32_t method, const uint32_t *params, uint32_t n);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
@@ -56,6 +57,9 @@ static int s_scan_enabled = -1;
  * is the title's main thread spinning until it is. */
 extern void xbox_Nv2aAckBusyBits(void);
 static uint32_t s_ack_tick;
+/* Words between answers: 16, or 256 when a thread of its own answers the
+ * kickoff (RECOMP_NV2A_KICK_SPIN) and the walk only covers the rest. */
+static uint32_t s_ack_mask = 0x0Fu;
 
 /* Either switch, read once. The answer "not set" has to be cached as well as
  * "set": this runs on every pass of the NV2A poll loop, and on the default
@@ -67,6 +71,15 @@ static int pb_walk_enabled(void)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
     if (s_scan_enabled < 0)
         s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
+    {
+        static int ack_read;
+        if (!ack_read) {
+            const char *e = getenv("RECOMP_NV2A_KICK_SPIN");
+            ack_read = 1;
+            if (e && atoi(e))
+                s_ack_mask = 0xFFu;
+        }
+    }
     return s_exec_enabled || s_scan_enabled;
 }
 
@@ -75,10 +88,14 @@ static int pb_walk_enabled(void)
  * (about 40% of its thread in X-Men Legends' levels). */
 static uint16_t s_seen_slot[8][0x2000 / 4];
 
-static void note(uint32_t subch, uint32_t method)
+static void note_slow(uint32_t subch, uint32_t method)
 {
     uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
 
+    /* The inventory is only ever printed under RECOMP_PB_SCAN
+     * (nv2a_pb_scan_report); taking it anyway was 5 % of the executor. */
+    if (!s_scan_enabled)
+        return;
     if (*slot) {
         s_seen[*slot - 1].count++;
         return;
@@ -102,6 +119,10 @@ static void note(uint32_t subch, uint32_t method)
         *slot = (uint16_t)s_seen_count;
     }
 }
+
+/* The check inline: a call per pushbuffer word was itself 2.6 % of the
+ * executor with the inventory off. */
+#define note(subch, method) (s_scan_enabled ? note_slow((subch), (method)) : (void)0)
 
 /* note() for a run of n words of one method. */
 static void note_n(uint32_t subch, uint32_t method, uint32_t n)
@@ -349,7 +370,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         at = s_get;
 
         /* Keep answering kickoffs while executing; see xbox_Nv2aAckBusyBits. */
-        if (s_exec_enabled && (++s_ack_tick & 0x0Fu) == 0)
+        if (s_exec_enabled && (++s_ack_tick & s_ack_mask) == 0)
             xbox_Nv2aAckBusyBits();
 
         if (s_get >= PB_RAM_BYTES) {
@@ -520,9 +541,22 @@ static void pb_seg_params(const uint8_t *mem, uint32_t *va, uint32_t end_va,
                    && nv2a_pb_exec_bulk(s_seg_pend.method,
                                         (const uint32_t *)(mem + *va), n)) {
             note_n(0, s_seg_pend.method, n);
-            if (((s_ack_tick + n) ^ s_ack_tick) & ~0x0Fu)
+            if (((s_ack_tick + n) ^ s_ack_tick) & ~s_ack_mask)
                 xbox_Nv2aAckBusyBits();
             s_ack_tick += n;
+            s_seg_pend.left -= n;
+            *va += 4 * n;
+            *words += n;
+        } else if (n && s_exec_enabled && !s_seg_pend.noninc && s_seg_pend.subch == 0
+                   && nv2a_pb_exec_bulk_inc(s_seg_pend.method,
+                                            (const uint32_t *)(mem + *va), n)) {
+            uint32_t k;
+            for (k = 0; k < n; k++)
+                note(0, s_seg_pend.method + 4 * k);
+            if (((s_ack_tick + n) ^ s_ack_tick) & ~s_ack_mask)
+                xbox_Nv2aAckBusyBits();
+            s_ack_tick += n;
+            s_seg_pend.method += 4 * n;
             s_seg_pend.left -= n;
             *va += 4 * n;
             *words += n;
@@ -531,7 +565,7 @@ static void pb_seg_params(const uint8_t *mem, uint32_t *va, uint32_t end_va,
     while (s_seg_pend.left && *va != end_va
            && (*va & 0x0FFFFFFFu) + 4 <= PB_RAM_BYTES) {
         /* Answer kickoffs mid-walk; see pb_follow. */
-        if (!s_dry && s_exec_enabled && (++s_ack_tick & 0x0Fu) == 0)
+        if (!s_dry && s_exec_enabled && (++s_ack_tick & s_ack_mask) == 0)
             xbox_Nv2aAckBusyBits();
         if (!s_dry)
             note(s_seg_pend.subch, s_seg_pend.method);
@@ -711,7 +745,7 @@ static int pb_follow(uint32_t from_phys, uint32_t put_phys, int dry)
          * decoded frame and spent 99 % of its time in that spin (sampled,
          * sub_0042F790): the cinematic ran at a frame a second and its audio
          * starved. The DMA walk always did this; the follow walk forgot. */
-        if (!dry && s_exec_enabled && (++s_ack_tick & 0x0Fu) == 0)
+        if (!dry && s_exec_enabled && (++s_ack_tick & s_ack_mask) == 0)
             xbox_Nv2aAckBusyBits();
         if (va == start && words) {
             va = start + 4;                       /* round the ring: not a */
