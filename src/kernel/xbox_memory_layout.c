@@ -3855,24 +3855,48 @@ static int heap_insert_free(int at, uint32_t addr, uint32_t size)
     return 1;
 }
 
-/* Take exactly `size` bytes, aligned, out of the first free block that has room
- * for them; what is left in front of and behind the piece stays free. Returns 0
- * when no free block fits. Caller holds g_heap_lock. */
+/* Take exactly `size` bytes, aligned, out of the smallest free block that has
+ * room for them; what is left in front of and behind the piece stays free.
+ * Returns 0 when no free block fits. Caller holds g_heap_lock.
+ *
+ * Smallest, not first: on the console NtAllocateVirtualMemory hands out pages
+ * from anywhere, so a title never meets fragmentation, and here every block
+ * needs one unbroken run. First fit let small requests nibble at the big hole
+ * a level leaves when it unloads; Ghost Recon 2's next level then wanted
+ * 5.2 MB in one piece, no hole had it, and the title stopped with "A problem
+ * has occurred" on the way from the main menu into the training mission. */
 static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
 {
+    int best = -1;
+    uint32_t best_size = 0;
+
     for (int i = 0; i < g_heap_block_count; i++) {
-        uint32_t a, start, end, front, back;
+        uint32_t a, start, end;
         if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
+            continue;
+        if (best >= 0 && g_heap_blocks[i].size >= best_size)
             continue;
         a = g_heap_blocks[i].addr;
         start = (a + alignment - 1) & ~(alignment - 1);
         end = a + g_heap_blocks[i].size;
         if (start + size > end || start + size < start)
             continue;   /* not enough room once aligned */
-        front = start - a;
-        back = end - (start + size);
+        best = i;
+        best_size = g_heap_blocks[i].size;
+        if (best_size == size)
+            break;
+    }
+    if (best < 0)
+        return 0;
+    {
+        int i = best;
+        uint32_t a = g_heap_blocks[i].addr;
+        uint32_t start = (a + alignment - 1) & ~(alignment - 1);
+        uint32_t end = a + g_heap_blocks[i].size;
+        uint32_t front = start - a, back = end - (start + size);
+
         if (front && !heap_insert_free(i, a, front))
-            continue;   /* table full: leave this block alone */
+            return 0;   /* table full: leave this block alone */
         if (front)
             i++;        /* the taken piece moved up one slot */
         g_heap_blocks[i].addr = start;
@@ -3883,7 +3907,6 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
         memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
         return start;
     }
-    return 0;
 }
 
 /*
@@ -4456,9 +4479,17 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
     if (result + size > XBOX_HEAP_TOP) {
-        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
+        uint32_t free_sum = 0, free_max = 0;
+        for (int i = 0; i < g_heap_block_count; i++) {
+            if (!g_heap_blocks[i].free) continue;
+            free_sum += g_heap_blocks[i].size;
+            if (g_heap_blocks[i].size > free_max) free_max = g_heap_blocks[i].size;
+        }
+        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u;"
+                " %u KB free in holes, largest %u KB)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
-                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE),
+                free_sum / 1024, free_max / 1024);
         /* Who ate the heap? Group live blocks by size -- an exhausted heap is
          * nearly always one request size repeated, and the count names it. */
         {
@@ -4604,6 +4635,25 @@ void xbox_HeapFree(uint32_t xbox_va)
              * that is free too is forgotten. Under the lock, so a block
              * reused at once is named afresh after this, not wiped by it. */
             heap_forget_ram_names(m);
+
+            /* The top block free: give it back to the bump pointer. Kept as a
+             * hole it could never join the untouched space above it, so a
+             * request bigger than either piece failed with both free. */
+            if (xbox_HeapReclaimEnabled()
+                    && g_heap_blocks[m].free && g_heap_blocks[m].size
+                    && g_heap_blocks[m].addr + g_heap_blocks[m].size == g_heap_next) {
+                int k;
+                for (k = m + 1; k < g_heap_block_count; k++)
+                    if (g_heap_blocks[k].size)
+                        break;
+                if (k == g_heap_block_count) {
+                    g_heap_next = g_heap_blocks[m].addr;
+                    g_heap_block_count = m;
+                    while (g_heap_block_count > 0
+                            && !g_heap_blocks[g_heap_block_count - 1].size)
+                        g_heap_block_count--;
+                }
+            }
         }
         ReleaseSRWLockExclusive(&g_heap_lock);
         return;

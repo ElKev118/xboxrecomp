@@ -268,6 +268,34 @@ int main(int argc, char **argv)
               "three freed neighbours merge into one 192-byte block", d);
     }
 
+    /* 2b. A small request takes the smallest hole that fits, not the first:
+     * the big hole a level leaves stays whole for the next level. */
+    if (reclaim) {
+        uint32_t big = xbox_HeapAlloc(0x100000, 16), g1 = xbox_HeapAlloc(64, 16);
+        uint32_t small = xbox_HeapAlloc(256, 16), g2 = xbox_HeapAlloc(64, 16);
+        uint32_t s, b;
+
+        (void)g1; (void)g2;
+        xbox_HeapFree(big);
+        xbox_HeapFree(small);
+        s = xbox_HeapAlloc(128, 16);
+        b = xbox_HeapAlloc(0x100000, 16);
+        snprintf(d, sizeof d, "128 at 0x%08X (small hole 0x%08X), 1 MB at 0x%08X (big hole 0x%08X)",
+                 s, small, b, big);
+        check(s == small && b == big, "best fit keeps the big hole whole", d);
+    }
+
+    /* 2c. Freeing the top block hands it back to the untouched space above,
+     * so a request bigger than either piece still fits there. */
+    if (reclaim) {
+        uint32_t t = xbox_HeapAlloc(0x10000, 16), u;
+
+        xbox_HeapFree(t);
+        u = xbox_HeapAlloc(0x20000, 16);
+        snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", u, t);
+        check(u == t, "a freed top block joins the space above it", d);
+    }
+
     /* 3. Releasing NtAllocateVirtualMemory memory returns it. */
     if (reclaim) {
         const uint32_t size = 2u * 1024 * 1024;
