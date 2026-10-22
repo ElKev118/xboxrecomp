@@ -1563,6 +1563,30 @@ void recomp_unimpl(const char *text, uint32_t va);
 #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
 
 /* ================================================================
+ * Checked accesses for functions that reach MMIO (--mmio-functions)
+ *
+ * The APU's registers sit at 0xFE800000 in a range kept unmapped, so every
+ * access faults and the trap decodes the host instruction and emulates it
+ * -- a few microseconds each, ~2.5 % of Ghost Recon 2's main thread. In the
+ * guest functions the run-time trap was seen in, the lifter writes these
+ * instead of MEMn: an address in the APU's range goes straight to the
+ * device, anything else is the plain access. A function not listed still
+ * works, through the trap.
+ * ================================================================ */
+uint32_t recomp_mmio_read(uint32_t va, int size);
+void recomp_mmio_write(uint32_t va, uint32_t value, int size);
+#define RECOMP_IS_MMIO(a) ((uint32_t)(a) - 0xFE800000u < 0x00080000u)
+#define MMIO_R32(a) (RECOMP_IS_MMIO(a) ? recomp_mmio_read((uint32_t)(a), 4) : MEM32(a))
+#define MMIO_R16(a) (RECOMP_IS_MMIO(a) ? (uint16_t)recomp_mmio_read((uint32_t)(a), 2) : MEM16(a))
+#define MMIO_R8(a)  (RECOMP_IS_MMIO(a) ? (uint8_t)recomp_mmio_read((uint32_t)(a), 1) : MEM8(a))
+#define MMIO_W32(a, v) do { uint32_t _mwa = (uint32_t)(a); uint32_t _mwv = (uint32_t)(v); \
+    if (RECOMP_IS_MMIO(_mwa)) recomp_mmio_write(_mwa, _mwv, 4); else MEM32(_mwa) = _mwv; } while (0)
+#define MMIO_W16(a, v) do { uint32_t _mwa = (uint32_t)(a); uint16_t _mwv = (uint16_t)(v); \
+    if (RECOMP_IS_MMIO(_mwa)) recomp_mmio_write(_mwa, _mwv, 2); else MEM16(_mwa) = _mwv; } while (0)
+#define MMIO_W8(a, v) do { uint32_t _mwa = (uint32_t)(a); uint8_t _mwv = (uint8_t)(v); \
+    if (RECOMP_IS_MMIO(_mwa)) recomp_mmio_write(_mwa, _mwv, 1); else MEM8(_mwa) = _mwv; } while (0)
+
+/* ================================================================
  * Guest registers as C locals (RECOMP_LOCAL_REGS)
  *
  * The registers are thread-local globals, and a global is something the
@@ -1613,6 +1637,22 @@ void recomp_unimpl(const char *text, uint32_t va);
 #define xmm5 l_xmm5
 #define xmm6 l_xmm6
 #define xmm7 l_xmm7
+#undef mm0
+#undef mm1
+#undef mm2
+#undef mm3
+#undef mm4
+#undef mm5
+#undef mm6
+#undef mm7
+#define mm0 l_mm0
+#define mm1 l_mm1
+#define mm2 l_mm2
+#define mm3 l_mm3
+#define mm4 l_mm4
+#define mm5 l_mm5
+#define mm6 l_mm6
+#define mm7 l_mm7
 #undef XBOX_PTR
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + l_mem)
 #define RECOMP_RETURN() do { RECOMP_REGS_OUT(); return; } while (0)

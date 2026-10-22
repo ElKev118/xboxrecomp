@@ -329,6 +329,84 @@ _LR_RETURN = None
 
 _LR_GPRS = ("eax", "ecx", "edx", "esp", "ebx", "esi", "edi")
 _LR_XMMS = tuple(f"xmm{i}" for i in range(8))
+_LR_MMXS = tuple(f"mm{i}" for i in range(8))
+
+# Guest functions whose memory accesses may reach MMIO (--mmio-functions):
+# their MEMn reads and writes check for the APU's range and call the device
+# directly (recomp_mmio_read/_write) instead of faulting into the trap.
+MMIO_FUNCS = set()
+
+
+def _mmio_accessors(lines):
+    """MEM8/16/32 in a function body -> MMIO_R8/16/32 and MMIO_W8/16/32.
+
+    A write is `MEMn(addr) = value` up to the statement's `;`; everything
+    else is a read. Parenthesis-aware, so nested accesses inside the address
+    or the value are rewritten too. Comments are left alone."""
+    import re
+    tok = re.compile(r'\bMEM(8|16|32)\(')
+
+    def close_paren(t, i):
+        depth = 0
+        while i < len(t):
+            if t[i] == '(':
+                depth += 1
+            elif t[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def stmt_end(t, i):
+        depth = 0
+        while i < len(t):
+            c = t[i]
+            if c in '([':
+                depth += 1
+            elif c in ')]':
+                if depth == 0:
+                    return i
+                depth -= 1
+            elif c in ';,' and depth == 0:
+                return i
+            i += 1
+        return len(t)
+
+    def rewrite(t):
+        out, i = [], 0
+        while True:
+            m = tok.search(t, i)
+            if not m:
+                out.append(t[i:])
+                return "".join(out)
+            out.append(t[i:m.start()])
+            size = m.group(1)
+            open_at = m.end() - 1
+            close = close_paren(t, open_at)
+            if close < 0:
+                out.append(t[m.start():])
+                return "".join(out)
+            addr = rewrite(t[open_at + 1:close])
+            j = close + 1
+            while j < len(t) and t[j] == ' ':
+                j += 1
+            if j < len(t) and t[j] == '=' and (j + 1 >= len(t) or t[j + 1] != '='):
+                end = stmt_end(t, j + 1)
+                value = rewrite(t[j + 1:end]).strip()
+                out.append(f"MMIO_W{size}({addr}, {value})")
+                i = end
+            else:
+                out.append(f"MMIO_R{size}({addr})")
+                i = close + 1
+
+    out = []
+    for line in lines:
+        code, sep, comment = line.partition("/*")
+        if "MEM" in code and not code.lstrip().startswith("#"):
+            code = rewrite(code)
+        out.append(code + sep + comment)
+    return out
 
 
 def _localize_regs(lines, call_names):
@@ -354,7 +432,7 @@ def _localize_regs(lines, call_names):
     if _LR_RETURN is None:
         _LR_RETURN = re.compile(r'\breturn;')
         _LR_REG_NAME = re.compile(
-            r'\b(' + "|".join(_LR_GPRS + _LR_XMMS) + r')\b')
+            r'\b(' + "|".join(_LR_GPRS + _LR_XMMS + _LR_MMXS) + r')\b')
     names = "|".join(sorted((re.escape(n) for n in call_names), key=len,
                             reverse=True))
     direct = re.compile(r'\b(sub_[0-9A-Fa-f]{8}\w*' + ("|" + names if names else "")
@@ -376,20 +454,37 @@ def _localize_regs(lines, call_names):
         used.update(_LR_REG_NAME.findall(re.sub(r"/\*.*?\*/", "", line)))
     gprs = [r for r in _LR_GPRS if r in used]
     xmms = [r for r in _LR_XMMS if r in used]
-    regs = gprs + xmms
+    mmxs = [r for r in _LR_MMXS if r in used]
+    regs = gprs + xmms + mmxs
+    # The x87 stack: the lifter names it as g_fp_stack / g_fp_top, in the
+    # fp_* macros and directly (st(i) operands, fnstsw). A function that uses
+    # it gets its own copy, synced like the registers.
+    x87 = any("g_fp_stack" in l or "g_fp_top" in l for l in lines[start:])
     decl = []
     if gprs:
         decl.append("    uint32_t " + ", ".join(f"l_{r} = g_{r}" for r in gprs) + ";")
     if xmms:
         decl.append("    RecompXmm " + ", ".join(f"l_{r} = g_{r}" for r in xmms) + ";")
+    if mmxs:
+        decl.append("    RecompMmx " + ", ".join(f"l_{r} = g_{r}" for r in mmxs) + ";")
+    if x87:
+        decl.append("    double l_fp_stack[8]; int l_fp_top = g_fp_top;")
+        decl.append("    memcpy(l_fp_stack, g_fp_stack, sizeof l_fp_stack);")
     decl.append("    const uintptr_t l_mem = (uintptr_t)g_xbox_mem_offset; (void)l_mem;")
+    fp_out = ("memcpy(g_fp_stack, l_fp_stack, sizeof l_fp_stack), g_fp_top = l_fp_top, "
+              if x87 else "")
+    fp_in = ("memcpy(l_fp_stack, g_fp_stack, sizeof l_fp_stack), l_fp_top = g_fp_top, "
+             if x87 else "")
     decl.append("#define RECOMP_REGS_OUT() (" + "".join(f"g_{r} = l_{r}, " for r in regs)
-                + "(void)0)")
+                + fp_out + "(void)0)")
     decl.append("#define RECOMP_REGS_IN() (" + "".join(f"l_{r} = g_{r}, " for r in regs)
-                + "(void)0)")
+                + fp_in + "(void)0)")
 
     out = lines[:start] + decl
+    fp_name = re.compile(r'\bg_fp_(stack|top)\b')
     for line in lines[start:]:
+        if x87 and "g_fp_" in line:
+            line = fp_name.sub(r"l_fp_\1", line)
         code, sep, comment = line.partition("/*")
         if "();" in code or "return;" in code or "setjmp" in code:
             code = direct.sub(call_sub, code)
@@ -3054,6 +3149,8 @@ class FunctionTranslator:
         if has_fpu:
             lines.extend(FP_STACK_UNDEFS)
 
+        if start in MMIO_FUNCS:
+            lines = _mmio_accessors(lines)
         if LOCAL_REGS:
             lines = _localize_regs(
                 lines, set(self.lifter.referenced_calls.values()))

@@ -141,3 +141,33 @@ def test_registers_cross_calls_in_local_mode(monkeypatch):
         assert built.returncode == 0, (built.stdout + built.stderr)[-4000:] + bodies
         ran = subprocess.run([str(exe)], cwd=tmp, capture_output=True, text=True)
         assert ran.returncode == 0, ran.stdout + bodies
+
+
+def test_mmx_registers_are_local():
+    out = _localize_regs(["{", "    mm0 = MMX_PADDW(mm0, mm1);"], set())
+    assert "    RecompMmx l_mm0 = g_mm0, l_mm1 = g_mm1;" in out
+    assert any("g_mm0 = l_mm0" in l and l.startswith("#define RECOMP_REGS_OUT") for l in out)
+
+
+def test_x87_stack_is_local_and_synced():
+    body = ["{", "    #define fp_top() g_fp_stack[g_fp_top]",
+            "    fp_top() = fp_top() * g_fp_stack[(g_fp_top + 2) & 7]; /* g_fp_top */",
+            "    sub_00012345();"]
+    out = _localize_regs(body, set())
+    assert "    double l_fp_stack[8]; int l_fp_top = g_fp_top;" in out
+    assert "    #define fp_top() l_fp_stack[l_fp_top]" in out
+    assert any("l_fp_stack[(l_fp_top + 2) & 7]" in l for l in out)
+    assert any(l.startswith("#define RECOMP_REGS_OUT") and "memcpy(g_fp_stack, l_fp_stack" in l
+               for l in out)
+
+
+def test_mmio_accessors_rewrite_reads_and_writes():
+    from tools.recomp.translator import _mmio_accessors
+    out = _mmio_accessors([
+        "    MEM32(eax + 0x20010) = MEM32(ecx + 4) | 1; /* MEM32(x) = y */",
+        "    edx = MEM8(esi) + MEM16(edi + 2);",
+        "    if (MEM32(eax) == 3) goto loc_1;",
+    ])
+    assert out[0] == "    MMIO_W32(eax + 0x20010, MMIO_R32(ecx + 4) | 1); /* MEM32(x) = y */"
+    assert out[1] == "    edx = MMIO_R8(esi) + MMIO_R16(edi + 2);"
+    assert out[2] == "    if (MMIO_R32(eax) == 3) goto loc_1;"

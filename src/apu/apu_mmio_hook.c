@@ -17,6 +17,22 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
+/* The direct path for recompiled functions that reach the APU (the lifter's
+ * MMIO_Rn / MMIO_Wn, see recomp_types.h): the same device calls the trap
+ * makes, without the fault. va is the guest address, in the APU's range. */
+uint32_t recomp_mmio_read(uint32_t va, int size)
+{
+    if (!g_apu_state)
+        return 0;
+    return (uint32_t)mcpx_apu_mmio_read(g_apu_state, va - 0xFE800000u, (unsigned)size);
+}
+
+void recomp_mmio_write(uint32_t va, uint32_t value, int size)
+{
+    if (g_apu_state)
+        mcpx_apu_mmio_write(g_apu_state, va - 0xFE800000u, value, (unsigned)size);
+}
+
 /* Windows: a VEH hands over the CONTEXT. POSIX arm64: a SIGBUS/SIGSEGV
  * handler hands over the ucontext (apu_hook_handle_mmio_posix, at the end).
  * x86-64 Linux has no trap yet. */
@@ -96,7 +112,34 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
-    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    bool ok;
+
+    {
+        /* RECOMP_MMIO_SITES=<file>: each host instruction that traps here,
+         * once, as an offset into the executable -- the recompiled functions
+         * that should reach the APU directly (recomp_mmio_read/_write)
+         * instead of through a fault. */
+        static int on = -1;
+        static FILE *f;
+        static uintptr_t seen[1024];
+        static int nseen;
+        if (on < 0) {
+            const char *e = getenv("RECOMP_MMIO_SITES");
+            on = e && *e && (f = fopen(e, "a")) != NULL;
+        }
+        if (on) {
+            uintptr_t rva = (uintptr_t)ctx->Rip - (uintptr_t)GetModuleHandle(NULL);
+            int k;
+            for (k = 0; k < nseen && seen[k] != rva; k++)
+                ;
+            if (k == nseen && nseen < 1024) {
+                seen[nseen++] = rva;
+                fprintf(f, "%llx %d\n", (unsigned long long)rva, is_write);
+                fflush(f);
+            }
+        }
+    }
+    ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
 
     /* What the title actually asks the APU for. The DSPs are stubbed here, so
      * a title that waits on one waits forever, and the only way to work out

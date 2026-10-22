@@ -280,7 +280,18 @@ def main():
                         help="Keep guest registers as thread-local globals in "
                              "every statement instead of C locals synced at "
                              "calls (RECOMP_LOCAL_REGS). Slower; for A/B runs")
+    parser.add_argument("--mmio-functions", metavar="JSON",
+                        help="JSON list of guest function addresses whose "
+                             "memory accesses may reach MMIO (the APU): their "
+                             "reads and writes check the address and call the "
+                             "device directly instead of faulting into the "
+                             "trap. Collect with RECOMP_MMIO_SITES at run time")
     args = parser.parse_args()
+    if args.mmio_functions:
+        from . import translator as _tr
+        with open(args.mmio_functions) as _f:
+            _tr.MMIO_FUNCS.update(int(a, 16) if isinstance(a, str) else int(a)
+                                  for a in json.load(_f))
     if args.global_regs:
         from . import translator as _tr
         _tr.LOCAL_REGS = False
