@@ -25,6 +25,8 @@
 #include "apu_state.h"
 #include "fpconv.h"
 
+#include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -99,19 +101,152 @@ static void dsp_ack_init(void)
                 s_dsp_ack_count, s_dsp_ack[0]);
 }
 
-/* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
+
+/* ---- stereo downmix of the mixbins (RECOMP_APU_MIXDOWN) -------------------
  *
- * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
- * because this changes audible output for every title and an escape hatch
- * costs one branch. */
-static int mcpx_apu_mixdown_all(void)
+ * On the console the GP runs DirectSound's DSP image: it mixes the 32 VP
+ * mixbins down to the speakers, runs the I3DL2 reverb on its send bin, and
+ * the title's effects on the FX sends. The GP is not emulated here, and the
+ * stand-in summed every bin at full level, even bins left and odd right:
+ * the centre went to the left speaker only (Ghost Recon 2's menu clicks,
+ * all in bin 2, came out of one side), LFE to the right only, and the
+ * reverb SEND -- in Ghost Recon 2 play the loudest bin of all, ~10x the
+ * direct front pair -- played dry, so explosions and gunfire buried the
+ * voices and clipped.
+ *
+ * The standard DirectSound assignment (DSMIXBIN_*) and what is done here:
+ *   0/1 front L/R, 4/5 back L/R, 6..9 crosstalk (3D) FL FR BL BR -> own side
+ *   2 centre -> both at -3 dB          3 LFE -> both, quieter
+ *   10 I3DL2 send -> a small reverb (Schroeder: 4 combs, 2 all-passes), wet
+ *   11..30 FX sends (title effects, not run) -> both, low
+ * Levels can be tuned: RECOMP_APU_GAIN_<REVERB|LFE|FX|BACK|3D|FRONT|CENTER>
+ * (linear factors), RECOMP_APU_MIXDOWN=all restores the old sum and
+ * =front reads bins 0/1 alone. A soft limiter replaces the hard clip. */
+
+typedef struct {
+    float *buf;
+    int len, pos;
+    float store;
+} RvComb;
+
+typedef struct {
+    float *buf;
+    int len, pos;
+} RvAllpass;
+
+static RvComb s_comb[2][4];
+static RvAllpass s_ap[2][2];
+static int s_rv_ready;
+
+static void rv_init(void)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
-        on = (e && *e) ? (atoi(e) != 0) : 1;
+    /* Freeverb's tunings scaled to 48 kHz; the right channel slightly
+     * longer, for width. */
+    static const int comb_len[4] = { 1215, 1293, 1390, 1476 };
+    static const int ap_len[2] = { 605, 480 };
+    int c, k;
+    for (c = 0; c < 2; c++) {
+        for (k = 0; k < 4; k++) {
+            s_comb[c][k].len = comb_len[k] + c * 25;
+            s_comb[c][k].buf = (float *)calloc((size_t)s_comb[c][k].len, sizeof(float));
+        }
+        for (k = 0; k < 2; k++) {
+            s_ap[c][k].len = ap_len[k] + c * 25;
+            s_ap[c][k].buf = (float *)calloc((size_t)s_ap[c][k].len, sizeof(float));
+        }
     }
-    return on;
+    s_rv_ready = 1;
+}
+
+static float rv_run(int c, float in)
+{
+    const float feedback = 0.80f, damp = 0.25f;
+    float out = 0.0f;
+    int k;
+    for (k = 0; k < 4; k++) {
+        RvComb *cb = &s_comb[c][k];
+        float y = cb->buf[cb->pos];
+        cb->store = y * (1.0f - damp) + cb->store * damp;
+        cb->buf[cb->pos] = in + cb->store * feedback;
+        if (++cb->pos == cb->len)
+            cb->pos = 0;
+        out += y;
+    }
+    for (k = 0; k < 2; k++) {
+        RvAllpass *ap = &s_ap[c][k];
+        float b = ap->buf[ap->pos];
+        ap->buf[ap->pos] = out + b * 0.5f;
+        out = b - out;
+        if (++ap->pos == ap->len)
+            ap->pos = 0;
+    }
+    return out * 0.25f;
+}
+
+static float env_gain(const char *name, float def)
+{
+    const char *e = getenv(name);
+    return (e && *e) ? (float)atof(e) : def;
+}
+
+/* 0 = stereo downmix (default), 1 = every bin even/odd (old), 2 = front pair. */
+static int mixdown_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("RECOMP_APU_MIXDOWN");
+        const char *old = getenv("RECOMP_APU_MIXDOWN_ALL");
+        m = 0;
+        if (e && !strcmp(e, "all")) m = 1;
+        else if (e && !strcmp(e, "front")) m = 2;
+        else if (old && *old && atoi(old) == 0) m = 2;
+    }
+    return m;
+}
+
+static float soft_limit(float x)
+{
+    /* Linear to 0.75, then a tanh knee that never reaches 1. */
+    float a = x < 0 ? -x : x;
+    if (a <= 0.75f)
+        return x;
+    a = 0.75f + 0.25f * tanhf((a - 0.75f) / 0.25f);
+    return x < 0 ? -a : a;
+}
+
+static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int i,
+                           float *outl, float *outr)
+{
+    static int init;
+    static float g_front, g_center, g_lfe, g_back, g_3d, g_rev, g_fx;
+    float l, r, fx = 0.0f, wet;
+    int b;
+
+    if (!init) {
+        g_front  = env_gain("RECOMP_APU_GAIN_FRONT", 1.0f);
+        g_center = env_gain("RECOMP_APU_GAIN_CENTER", 0.707f);
+        g_lfe    = env_gain("RECOMP_APU_GAIN_LFE", 0.35f);
+        g_back   = env_gain("RECOMP_APU_GAIN_BACK", 0.707f);
+        g_3d     = env_gain("RECOMP_APU_GAIN_3D", 1.0f);
+        g_rev    = env_gain("RECOMP_APU_GAIN_REVERB", 0.35f);
+        g_fx     = env_gain("RECOMP_APU_GAIN_FX", 0.25f);
+        init = 1;
+    }
+    if (!s_rv_ready)
+        rv_init();
+    l = g_front * mixbins[0][i] + g_back * mixbins[4][i] + g_3d * (mixbins[6][i] + mixbins[8][i]);
+    r = g_front * mixbins[1][i] + g_back * mixbins[5][i] + g_3d * (mixbins[7][i] + mixbins[9][i]);
+    l += g_center * mixbins[2][i] + g_lfe * mixbins[3][i];
+    r += g_center * mixbins[2][i] + g_lfe * mixbins[3][i];
+    for (b = 11; b < NUM_MIXBINS; b++)
+        fx += mixbins[b][i];
+    l += g_fx * fx;
+    r += g_fx * fx;
+    wet = mixbins[10][i];
+    l += g_rev * rv_run(0, wet);
+    r += g_rev * rv_run(1, wet);
+    *outl = l;
+    *outr = r;
 }
 
 /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
@@ -248,6 +383,32 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    {
+        /* RECOMP_APU_BINSTAT=1: the energy each mixbin carries (mean |x| per
+         * sample, over ~10 s), to see where a title routes its sound. */
+        static int on = -1;
+        static double acc[NUM_MIXBINS];
+        static unsigned frames;
+        if (on < 0)
+            on = getenv("RECOMP_APU_BINSTAT") != NULL;
+        if (on) {
+            int b, i;
+            for (b = 0; b < NUM_MIXBINS; b++)
+                for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                    acc[b] += mixbins[b][i] < 0 ? -mixbins[b][i] : mixbins[b][i];
+            if (++frames == 15000) {           /* 32-sample frames at 48 kHz */
+                fprintf(stderr, "[APU-BINS]");
+                for (b = 0; b < NUM_MIXBINS; b++)
+                    if (acc[b] > 0)
+                        fprintf(stderr, " %d:%.5f", b,
+                                acc[b] / (frames * (double)NUM_SAMPLES_PER_FRAME));
+                fprintf(stderr, "\n");
+                memset(acc, 0, sizeof acc);
+                frames = 0;
+            }
+        }
+    }
+
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
@@ -278,7 +439,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * counts. This is not what a real EP does; it is the cheapest
              * mixdown that stops discarding audio. */
             float left, right;
-            if (mcpx_apu_mixdown_all()) {
+            if (mixdown_mode() == 0) {
+                downmix_stereo(mixbins, i, &left, &right);
+            } else if (mixdown_mode() == 1) {
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {
@@ -288,6 +451,10 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             } else {
                 left = mixbins[0][i];
                 right = mixbins[1][i];
+            }
+            if (mixdown_mode() == 0) {
+                left = soft_limit(left);
+                right = soft_limit(right);
             }
             /* Clamp to [-1, 1] range */
             if (left > 1.0f) left = 1.0f;
