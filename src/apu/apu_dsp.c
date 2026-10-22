@@ -117,7 +117,9 @@ static void dsp_ack_init(void)
  * The standard DirectSound assignment (DSMIXBIN_*) and what is done here:
  *   0/1 front L/R, 4/5 back L/R, 6..9 crosstalk (3D) FL FR BL BR -> own side
  *   2 centre -> both at -3 dB          3 LFE -> both, quieter
- *   10 I3DL2 send -> a small reverb (Schroeder: 4 combs, 2 all-passes), wet
+ *   10 I3DL2 send -> a soft reverb (Freeverb-like: 8 damped combs, 2
+ *      all-passes), low: with 4 short combs and more level the characters'
+ *      voices sounded shut in a small room
  *   11..30 FX sends (title effects, not run) -> both, low
  * Levels can be tuned: RECOMP_APU_GAIN_<REVERB|LFE|FX|BACK|3D|FRONT|CENTER>
  * (linear factors), RECOMP_APU_MIXDOWN=all restores the old sum and
@@ -134,7 +136,7 @@ typedef struct {
     int len, pos;
 } RvAllpass;
 
-static RvComb s_comb[2][4];
+static RvComb s_comb[2][8];
 static RvAllpass s_ap[2][2];
 static int s_rv_ready;
 
@@ -142,11 +144,11 @@ static void rv_init(void)
 {
     /* Freeverb's tunings scaled to 48 kHz; the right channel slightly
      * longer, for width. */
-    static const int comb_len[4] = { 1215, 1293, 1390, 1476 };
+    static const int comb_len[8] = { 1214, 1293, 1389, 1475, 1547, 1622, 1694, 1759 };
     static const int ap_len[2] = { 605, 480 };
     int c, k;
     for (c = 0; c < 2; c++) {
-        for (k = 0; k < 4; k++) {
+        for (k = 0; k < 8; k++) {
             s_comb[c][k].len = comb_len[k] + c * 25;
             s_comb[c][k].buf = (float *)calloc((size_t)s_comb[c][k].len, sizeof(float));
         }
@@ -160,10 +162,10 @@ static void rv_init(void)
 
 static float rv_run(int c, float in)
 {
-    const float feedback = 0.80f, damp = 0.25f;
+    const float feedback = 0.84f, damp = 0.45f;
     float out = 0.0f;
     int k;
-    for (k = 0; k < 4; k++) {
+    for (k = 0; k < 8; k++) {
         RvComb *cb = &s_comb[c][k];
         float y = cb->buf[cb->pos];
         cb->store = y * (1.0f - damp) + cb->store * damp;
@@ -180,7 +182,7 @@ static float rv_run(int c, float in)
         if (++ap->pos == ap->len)
             ap->pos = 0;
     }
-    return out * 0.25f;
+    return out * 0.125f;
 }
 
 static float env_gain(const char *name, float def)
@@ -228,7 +230,7 @@ static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], in
         g_lfe    = env_gain("RECOMP_APU_GAIN_LFE", 0.35f);
         g_back   = env_gain("RECOMP_APU_GAIN_BACK", 0.707f);
         g_3d     = env_gain("RECOMP_APU_GAIN_3D", 1.0f);
-        g_rev    = env_gain("RECOMP_APU_GAIN_REVERB", 0.35f);
+        g_rev    = env_gain("RECOMP_APU_GAIN_REVERB", 0.15f);
         g_fx     = env_gain("RECOMP_APU_GAIN_FX", 0.25f);
         init = 1;
     }
