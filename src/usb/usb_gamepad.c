@@ -556,6 +556,15 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+/* While set, every pad reports nothing pressed: a host overlay (the port's
+ * options menu) has the controls, and the title must not act on them. */
+static volatile int s_input_blocked;
+
+void xbox_InputSetBlocked(int blocked)
+{
+    s_input_blocked = blocked;
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -604,6 +613,9 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
             }
         }
     }
+
+    if (s_input_blocked)
+        return 20;              /* neutral: no buttons, sticks centred */
 
     /* The synthetic press and the host pad drive pad n from host pad n. */
     if (pad != 0)

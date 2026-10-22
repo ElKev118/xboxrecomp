@@ -89,6 +89,24 @@ static inline uint32_t apu_mapped_ram(void)
     return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
 }
 
+/* Host output level in percent, settable while running (the port's options
+ * menu). Negative until the first use reads RECOMP_AUDIO_VOLUME. */
+static volatile int s_volume = -1;
+
+void xbox_AudioSetVolume(int pct)
+{
+    s_volume = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+}
+
+int xbox_AudioGetVolume(void)
+{
+    if (s_volume < 0) {
+        const char *e = getenv("RECOMP_AUDIO_VOLUME");
+        xbox_AudioSetVolume(e ? atoi(e) : 100);
+    }
+    return s_volume;
+}
+
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
@@ -869,13 +887,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
      * The device keeps being fed at the same pace: the title's timing does
      * not change with the volume. */
     {
-        static int vol = -1;
-        if (vol < 0) {
-            const char *e = getenv("RECOMP_AUDIO_VOLUME");
-            vol = e ? atoi(e) : 100;
-            if (vol < 0) vol = 0;
-            if (vol > 100) vol = 100;
-        }
+        int vol = xbox_AudioGetVolume();
         if (vol != 100) {
             int16_t *p = (int16_t *)period;
             int i;

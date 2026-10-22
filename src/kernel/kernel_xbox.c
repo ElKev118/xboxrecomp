@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* ============================================================================
@@ -136,9 +137,14 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
-        /* English = 1 */
+        /* The dashboard language, which titles read once at boot to pick
+         * their text, voices and movies. RECOMP_LANGUAGE=<n> sets it, in the
+         * console's codes: 1 English (default), 2 Japanese, 3 German,
+         * 4 French, 5 Spanish, 6 Italian, 7 Korean, 8 Chinese, 9 Portuguese. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            const char *e = getenv("RECOMP_LANGUAGE");
+            int lang = e ? atoi(e) : 1;
+            *(PULONG)Value = (lang >= 1 && lang <= 9) ? (ULONG)lang : 1;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

@@ -191,6 +191,22 @@ static float env_gain(const char *name, float def)
     return (e && *e) ? (float)atof(e) : def;
 }
 
+/* The reverb send, settable while running (the port's options menu).
+ * Negative until the first use reads RECOMP_APU_GAIN_REVERB. */
+static volatile float s_rev_gain = -1.0f;
+
+void xbox_AudioSetReverb(float gain)
+{
+    s_rev_gain = gain < 0.0f ? 0.0f : gain;
+}
+
+float xbox_AudioGetReverb(void)
+{
+    if (s_rev_gain < 0.0f)
+        s_rev_gain = env_gain("RECOMP_APU_GAIN_REVERB", 0.08f);
+    return s_rev_gain;
+}
+
 /* 0 = stereo downmix (default), 1 = every bin even/odd (old), 2 = front pair. */
 static int mixdown_mode(void)
 {
@@ -220,7 +236,8 @@ static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], in
                            float *outl, float *outr)
 {
     static int init;
-    static float g_front, g_center, g_lfe, g_back, g_3d, g_rev, g_fx;
+    static float g_front, g_center, g_lfe, g_back, g_3d, g_fx;
+    float g_rev = xbox_AudioGetReverb();
     float l, r, fx = 0.0f, wet;
     int b;
 
@@ -230,7 +247,6 @@ static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], in
         g_lfe    = env_gain("RECOMP_APU_GAIN_LFE", 0.35f);
         g_back   = env_gain("RECOMP_APU_GAIN_BACK", 0.707f);
         g_3d     = env_gain("RECOMP_APU_GAIN_3D", 1.0f);
-        g_rev    = env_gain("RECOMP_APU_GAIN_REVERB", 0.08f);
         g_fx     = env_gain("RECOMP_APU_GAIN_FX", 0.25f);
         init = 1;
     }
