@@ -45,8 +45,14 @@ def _cc():
 
 
 def _macro(name):
-    """One #define from the runtime header, continuation lines included."""
+    """One #define from the runtime header, continuation lines included.
+
+    The call macros are defined as NAME_G (guest registers as globals) and
+    NAME wraps that with the RECOMP_LOCAL_REGS sync; the harness wants the
+    body, so a NAME_G definition is returned under NAME."""
     lines = open(HEADER, encoding="utf-8").read().splitlines()
+    if any(re.match(r"#define\s+%s_G\(" % re.escape(name), l) for l in lines):
+        return _macro(name + "_G").replace(name + "_G(", name + "(", 1)
     for i, line in enumerate(lines):
         if re.match(r"#define\s+%s\(" % re.escape(name), line):
             out = [line]
@@ -76,12 +82,14 @@ typedef void (*recomp_func_t)(void);
 volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE], g_icall_trace_idx;
 volatile uint64_t g_icall_count;
 uint32_t g_xbox_code_lo = 0x00010000u, g_xbox_code_hi = 0x00020000u;
-uint32_t g_esp, eax;
+uint32_t g_esp, g_eax;
 #define esp g_esp
+#define eax g_eax
 #define PUSH32(sp, v) do { (sp) -= 4; } while (0)
 #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
 #define RECOMP_ICALL_OBSERVE_SITE(site, va) ((void)0)
 #define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ABI_CALL_G(va, fn) (fn)()
 static int hits, misses, lookups, fails, called_a, called_b, called_c;
 #define RECOMP_ICALL_GUARD_HIT()  ((void)hits++)
 #define RECOMP_ICALL_GUARD_MISS() ((void)misses++)

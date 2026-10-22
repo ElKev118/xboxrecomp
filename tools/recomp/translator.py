@@ -308,13 +308,75 @@ def _fixup_icall_esp_save(lines):
         if i in insert_before:
             # Determine indentation from the current line
             indent = line[:len(line) - len(line.lstrip())]
-            result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
+            # `esp`, not g_esp: under RECOMP_LOCAL_REGS the current value is
+            # the local, and the global is only written at the call.
+            result.append(f"{indent}{{ uint32_t _icall_esp = esp;")
         result.append(line)
         if _is_safe_icall(line):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
     return result
+
+
+# Guest registers as C locals (RECOMP_LOCAL_REGS in recomp_types.h). On by
+# default; --global-regs turns it off for comparison runs.
+LOCAL_REGS = True
+
+_LR_DIRECT_CALL = None
+_LR_RETURN = None
+
+
+def _localize_regs(lines, call_names):
+    """Rewrite a finished function body for RECOMP_LOCAL_REGS.
+
+    The registers become locals (declared by RECOMP_REGS_DECL after the
+    opening brace), so the globals have to be current wherever anything
+    outside this function can read them, and the locals reloaded wherever
+    anything outside can have changed them. The call macros do that
+    themselves; what the lifter writes as plain C is handled here:
+
+      NAME(); return;   a tail call: publish, call, return -- the callee's
+                        registers are the result, so nothing is written after
+      NAME();           a direct call: publish, call, reload
+      return;           publish, return
+      setjmp landing    reload: the longjmp set the globals
+      longjmp           publish first: it reads the guest state
+    """
+    import re
+    global _LR_DIRECT_CALL, _LR_RETURN
+    if _LR_RETURN is None:
+        _LR_RETURN = re.compile(r'\breturn;')
+    names = "|".join(sorted((re.escape(n) for n in call_names), key=len,
+                            reverse=True))
+    direct = re.compile(r'\b(sub_[0-9A-Fa-f]{8}\w*' + ("|" + names if names else "")
+                        + r')\(\);(\s*return;)?')
+
+    def call_sub(m):
+        if m.group(2):
+            return f"RECOMP_REGS_OUT(); {m.group(1)}(); RECOMP_TAIL_RETURN;"
+        return f"RECOMP_REGS_OUT(); {m.group(1)}(); RECOMP_REGS_IN();"
+
+    out = []
+    opened = False
+    for line in lines:
+        if not opened:
+            out.append(line)
+            if line == "{":
+                out.append("    RECOMP_REGS_DECL")
+                opened = True
+            continue
+        code, sep, comment = line.partition("/*")
+        if "();" in code or "return;" in code or "setjmp" in code:
+            code = direct.sub(call_sub, code)
+            code = _LR_RETURN.sub("RECOMP_RETURN();", code)
+            code = code.replace("RECOMP_TAIL_RETURN;", "return;")
+            code = code.replace("if (_sjv) {", "if (_sjv) { RECOMP_REGS_IN();")
+            code = code.replace("if (!recomp_guest_longjmp(",
+                                "RECOMP_REGS_OUT(); if (!recomp_guest_longjmp(")
+            line = code + sep + comment
+        out.append(line)
+    return out
 
 
 # The x87 stack accessors the lifter's output is written against. Module-level
@@ -2966,6 +3028,10 @@ class FunctionTranslator:
         if has_fpu:
             lines.extend(FP_STACK_UNDEFS)
 
+        if LOCAL_REGS:
+            lines = _localize_regs(
+                lines, set(self.lifter.referenced_calls.values()))
+
         lines.append(f"}}")
         lines.append(f"")
 
@@ -3193,6 +3259,8 @@ class BatchTranslator:
         c_chunks.append(" */")
         c_chunks.append("")
         c_chunks.append('#define RECOMP_GENERATED_CODE')
+        if LOCAL_REGS:
+            c_chunks.append('#define RECOMP_LOCAL_REGS')
         c_chunks.append('#include "recomp_types.h"')
         c_chunks.append('#include <math.h>')
         c_chunks.append("")
@@ -3484,6 +3552,7 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+            ] + (["#define RECOMP_LOCAL_REGS"] if LOCAL_REGS else []) + [
                 f'#include "{header_name}"',
                 '#include <math.h>',
                 "",

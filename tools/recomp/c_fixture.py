@@ -18,6 +18,11 @@ def command(cc, sources, output, *, include_dirs=(), defines=(),
             compile_only=False, gnu_flags=()):
     """Build/link or compile only, preserving GNU-specific checks on GNU tools."""
     sources = list(map(str, sources))
+    # Compile the fixtures' generated code the way the lifter's output now
+    # is compiled for real: guest registers as locals (see conftest.py).
+    import os
+    if os.environ.get('RECOMP_TEST_LOCAL_REGS') == '1':
+        defines = (*defines, 'RECOMP_LOCAL_REGS')
     if is_msvc(cc):
         if any(flag.startswith('-fsanitize=') for flag in gnu_flags):
             raise ValueError('MSVC has no signed-integer-overflow sanitizer')

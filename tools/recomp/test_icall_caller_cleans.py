@@ -23,7 +23,7 @@ def test_actual_add_snapshots_do_not_hide_cleanup(guarded):
     code = translate(guarded=guarded)
     assert '/* add source, before the write */' in code
     assert 'RECOMP_ICALL_SAFE_AT_CC(_icall_target' in code
-    assert '_icall_esp = g_esp' in code
+    assert '_icall_esp = esp' in code
     assert code.count('{') == code.count('}')
 
 

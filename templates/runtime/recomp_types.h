@@ -1042,7 +1042,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);
-#define RECOMP_ABI_CALL(va, fn) do { \
+#define RECOMP_ABI_CALL_G(va, fn) do { \
     uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
     (fn)(); \
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
@@ -1053,9 +1053,9 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * keeps the counts (a project defines recomp_call_profile_hit). Diffing the counts
  * of two situations shows which functions one of them runs and the other does not. */
 void recomp_call_profile_hit(uint32_t va);
-#define RECOMP_ABI_CALL(va, fn) do { recomp_call_profile_hit(va); (fn)(); } while(0)
+#define RECOMP_ABI_CALL_G(va, fn) do { recomp_call_profile_hit(va); (fn)(); } while(0)
 #else
-#define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ABI_CALL_G(va, fn) (fn)()
 #endif
 
 /* A guarded arm of an indirect call. When a recorded run saw a call site
@@ -1091,7 +1091,7 @@ extern volatile uint64_t g_icall_guard_misses;
  * left over from a hardcoded 0x00400000 cutoff that was only ever right for
  * one title. Editing this header per project is no longer a thing.
  */
-#define RECOMP_ICALL(xbox_va) do { \
+#define RECOMP_ICALL_G(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
@@ -1099,15 +1099,15 @@ extern volatile uint64_t g_icall_guard_misses;
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp += 4; eax = 0; break; \
+        g_esp += 4; g_eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ABI_CALL_G(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 
 /**
@@ -1118,26 +1118,26 @@ extern volatile uint64_t g_icall_guard_misses;
  * Use this when the caller pushes arguments that the callee would
  * normally clean up (stdcall convention).
  */
-#define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
+#define RECOMP_ICALL_SAFE_G(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp = (saved_esp); eax = 0; break; \
+        g_esp = (saved_esp); g_eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ABI_CALL_G(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+           recomp_icall_fail_log(_va); g_esp = (saved_esp); g_eax = 0; } \
 } while(0)
 
 /* Caller cleanup: a failed call pops only its return address. */
-#define RECOMP_ICALL_SAFE_CC(xbox_va, saved_esp) do { \
+#define RECOMP_ICALL_SAFE_CC_G(xbox_va, saved_esp) do { \
     (void)(saved_esp); \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
@@ -1145,15 +1145,15 @@ extern volatile uint64_t g_icall_guard_misses;
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp += 4; eax = 0; break; \
+        g_esp += 4; g_eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ABI_CALL_G(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 
 /**
@@ -1164,27 +1164,27 @@ extern volatile uint64_t g_icall_guard_misses;
  * (icall_sites.dump), which is what lets the lifter guard a site with direct
  * calls on the next generation. Everything else is RECOMP_ICALL_SAFE.
  */
-#define RECOMP_ICALL_SAFE_AT(xbox_va, saved_esp, site) do { \
+#define RECOMP_ICALL_SAFE_AT_G(xbox_va, saved_esp, site) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp = (saved_esp); eax = 0; break; \
+        g_esp = (saved_esp); g_eax = 0; break; \
     } \
     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ABI_CALL_G(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+           recomp_icall_fail_log(_va); g_esp = (saved_esp); g_eax = 0; } \
 } while(0)
 
 /* Caller cleanup: a failed call pops only its return address. */
-#define RECOMP_ICALL_SAFE_AT_CC(xbox_va, saved_esp, site) do { \
+#define RECOMP_ICALL_SAFE_AT_CC_G(xbox_va, saved_esp, site) do { \
     (void)(saved_esp); \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
@@ -1192,16 +1192,16 @@ extern volatile uint64_t g_icall_guard_misses;
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp += 4; eax = 0; break; \
+        g_esp += 4; g_eax = 0; break; \
     } \
     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ABI_CALL_G(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 
 /**
@@ -1211,13 +1211,13 @@ extern volatile uint64_t g_icall_guard_misses;
  * Used for tail-call optimization where the original code uses
  * jmp [reg] instead of call [reg].
  */
-#define RECOMP_ITAIL(xbox_va) do { \
+#define RECOMP_ITAIL_G(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ABI_CALL_G(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
@@ -1561,5 +1561,81 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
  * enumerates every site whether or not it is ever reached. */
 void recomp_unimpl(const char *text, uint32_t va);
 #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+
+/* ================================================================
+ * Guest registers as C locals (RECOMP_LOCAL_REGS)
+ *
+ * The registers are thread-local globals, and a global is something the
+ * compiler must assume any store can change: every guest instruction became
+ * a read-modify-write of TLS memory, the TLS base was recomputed after each
+ * guest store, and the guest memory base was reloaded on every access --
+ * three or four host instructions of bookkeeping per guest instruction.
+ * Ghost Recon 2's main thread spent most of its time there.
+ *
+ * In this mode each generated function copies the seven registers and the
+ * memory base into locals on entry (RECOMP_REGS_DECL), which the compiler
+ * keeps in host registers, and hands them back only where something else
+ * can look: before every call and return (RECOMP_REGS_OUT) and after every
+ * call (RECOMP_REGS_IN). ebp was already a local. The call macros wrap
+ * their _G (global-register) forms; the lifter wraps direct calls, returns,
+ * setjmp and longjmp.
+ * ================================================================ */
+#if defined(RECOMP_GENERATED_CODE) && defined(RECOMP_LOCAL_REGS)
+#undef eax
+#undef ecx
+#undef edx
+#undef esp
+#undef ebx
+#undef esi
+#undef edi
+#define eax l_eax
+#define ecx l_ecx
+#define edx l_edx
+#define esp l_esp
+#define ebx l_ebx
+#define esi l_esi
+#define edi l_edi
+#undef XBOX_PTR
+#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + l_mem)
+#define RECOMP_REGS_DECL \
+    uint32_t l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_esp = g_esp, \
+             l_ebx = g_ebx, l_esi = g_esi, l_edi = g_edi; \
+    const uintptr_t l_mem = (uintptr_t)g_xbox_mem_offset; \
+    (void)l_mem;
+#define RECOMP_REGS_OUT() (g_eax = l_eax, g_ecx = l_ecx, g_edx = l_edx, \
+    g_esp = l_esp, g_ebx = l_ebx, g_esi = l_esi, g_edi = l_edi, (void)0)
+#define RECOMP_REGS_IN() (l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, \
+    l_esp = g_esp, l_ebx = g_ebx, l_esi = g_esi, l_edi = g_edi, (void)0)
+#define RECOMP_RETURN() do { RECOMP_REGS_OUT(); return; } while (0)
+#define RECOMP_REGS_CALL(stmt) do { RECOMP_REGS_OUT(); stmt; RECOMP_REGS_IN(); } while (0)
+#define RECOMP_ABI_CALL(va, fn) RECOMP_REGS_CALL(RECOMP_ABI_CALL_G(va, fn))
+#define RECOMP_ICALL(a) RECOMP_REGS_CALL(RECOMP_ICALL_G(a))
+#define RECOMP_ICALL_SAFE(a, s) RECOMP_REGS_CALL(RECOMP_ICALL_SAFE_G(a, s))
+#define RECOMP_ICALL_SAFE_CC(a, s) RECOMP_REGS_CALL(RECOMP_ICALL_SAFE_CC_G(a, s))
+#define RECOMP_ICALL_SAFE_AT(a, s, t) RECOMP_REGS_CALL(RECOMP_ICALL_SAFE_AT_G(a, s, t))
+#define RECOMP_ICALL_SAFE_AT_CC(a, s, t) RECOMP_REGS_CALL(RECOMP_ICALL_SAFE_AT_CC_G(a, s, t))
+#define RECOMP_ITAIL(a) RECOMP_REGS_CALL(RECOMP_ITAIL_G(a))
+/* Read the registers, so they must be current. */
+#undef RECOMP_TRACE_ENTER
+#undef RECOMP_TRACE_EXIT
+#undef RECOMP_TRACE_ESP
+#undef RECOMP_UNIMPL
+#define RECOMP_TRACE_ENTER(name, va) (RECOMP_REGS_OUT(), recomp_trace_enter((name), (va)))
+#define RECOMP_TRACE_EXIT(name, va) (RECOMP_REGS_OUT(), recomp_trace_exit((name), (va)))
+#define RECOMP_TRACE_ESP(name, tag) (RECOMP_REGS_OUT(), recomp_trace_esp((name), (tag)))
+#define RECOMP_UNIMPL(_text, _va) (RECOMP_REGS_OUT(), recomp_unimpl((_text), (_va)))
+#else
+#define RECOMP_REGS_DECL
+#define RECOMP_REGS_OUT() ((void)0)
+#define RECOMP_REGS_IN() ((void)0)
+#define RECOMP_RETURN() return
+#define RECOMP_ABI_CALL(va, fn) RECOMP_ABI_CALL_G(va, fn)
+#define RECOMP_ICALL(a) RECOMP_ICALL_G(a)
+#define RECOMP_ICALL_SAFE(a, s) RECOMP_ICALL_SAFE_G(a, s)
+#define RECOMP_ICALL_SAFE_CC(a, s) RECOMP_ICALL_SAFE_CC_G(a, s)
+#define RECOMP_ICALL_SAFE_AT(a, s, t) RECOMP_ICALL_SAFE_AT_G(a, s, t)
+#define RECOMP_ICALL_SAFE_AT_CC(a, s, t) RECOMP_ICALL_SAFE_AT_CC_G(a, s, t)
+#define RECOMP_ITAIL(a) RECOMP_ITAIL_G(a)
+#endif
 
 #endif /* RECOMP_TYPES_H */

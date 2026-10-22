@@ -276,7 +276,14 @@ def main():
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
+    parser.add_argument("--global-regs", action="store_true",
+                        help="Keep guest registers as thread-local globals in "
+                             "every statement instead of C locals synced at "
+                             "calls (RECOMP_LOCAL_REGS). Slower; for A/B runs")
     args = parser.parse_args()
+    if args.global_regs:
+        from . import translator as _tr
+        _tr.LOCAL_REGS = False
 
     # Reset on every CLI invocation, including one with no manual file.
     from . import translator as translator_module
