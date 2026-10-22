@@ -175,6 +175,36 @@ extern unsigned long apu_vp_frames(void);
 
 void recomp_trace_enter(const char *name, uint32_t va)
 {
+    {
+        /* RECOMP_TRACE_TIMES=va[,va...]: a line per entry to just those
+         * traced functions, on the APU clock -- how often something happens
+         * (a movie frame decoded), cheap enough not to change the timing it
+         * measures, unlike the full trace. */
+        static int n = -1;
+        static uint32_t vas[16];
+        if (n < 0) {
+            const char *e = getenv("RECOMP_TRACE_TIMES");
+            n = 0;
+            while (e && *e && n < 16) {
+                char *end;
+                vas[n++] = (uint32_t)strtoul(e, &end, 16);
+                e = *end ? end + 1 : end;
+            }
+        }
+        if (n) {
+            int k;
+            for (k = 0; k < n; k++)
+                if (vas[k] == va) {
+                    const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset();
+                    fprintf(stderr, "[CALL] f=%lu %s ecx=%08X args %08X %08X %08X\n",
+                            apu_vp_frames(), name, g_ecx,
+                            *(const uint32_t *)(m + g_esp + 4),
+                            *(const uint32_t *)(m + g_esp + 8),
+                            *(const uint32_t *)(m + g_esp + 12));
+                    break;
+                }
+        }
+    }
     if (prof_enabled()) { prof_count(name, va); return; }
     if (!trace_budget()) return;
     /* The return address as well as the registers: at entry it is still at

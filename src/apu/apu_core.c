@@ -276,6 +276,17 @@ static void apu_deliver_irq(MCPXAPUState *d)
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+    {
+        /* RECOMP_APU_IRQLOG=1: when each delivery happens, on the APU clock,
+         * and what was pending -- to time notification -> service routine. */
+        static int lg = -1;
+        extern unsigned long apu_vp_frames(void);
+        if (lg < 0)
+            lg = getenv("RECOMP_APU_IRQLOG") != NULL;
+        if (lg)
+            fprintf(stderr, "[APU-IRQ] f=%lu ISR ISTS=%08X\n", apu_vp_frames(),
+                    (unsigned)qatomic_read(&d->regs[NV_PAPU_ISTS]));
+    }
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
