@@ -3726,7 +3726,12 @@ static void draw_primitive(void)
         }
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    /* Cached: getenv takes the CRT lock and walks the environment, and once
+     * per draw it was 15 % of the executor's time in Ghost Recon 2 play. */
+    static int verbose = -1;
+    if (verbose < 0)
+        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (verbose) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -4094,6 +4099,47 @@ static void tex_stage_method(uint32_t method, uint32_t param)
      * four PCF taps on stages 0-3 with a white border, and taps 1-3 lost
      * it, so ground outside a soldier's shadow map compared as shadowed. */
     record_tex_reg(method, param);
+}
+
+/* A run of n non-incrementing subchannel-0 parameters of one method, when it
+ * is plain batch data: indices or INLINE_ARRAY words, the bulk of every
+ * frame. Returns 0 to have the walk feed them through nv2a_pb_exec_method
+ * one by one instead; the result is the same either way. */
+int nv2a_pb_exec_bulk(uint32_t method, const uint32_t *params, uint32_t n)
+{
+    uint32_t i, k;
+
+    if (!s_gpu.prim || !n)
+        return 0;
+    switch (method) {
+    case NV097_ARRAY_ELEMENT16:
+        k = s_gpu.idx_count;
+        for (i = 0; i < n && k + 2 <= NV_MAX_INDICES; i++) {
+            s_gpu.idx[k++] = params[i] & 0xFFFFu;
+            s_gpu.idx[k++] = params[i] >> 16;
+        }
+        s_gpu.idx_count = k;
+        break;
+    case 0x1808:                            /* ARRAY_ELEMENT32 */
+        k = s_gpu.idx_count;
+        if (n > NV_MAX_INDICES - k)
+            i = NV_MAX_INDICES - k;
+        else
+            i = n;
+        memcpy(&s_gpu.idx[k], params, i * 4);
+        s_gpu.idx_count = k + i;
+        break;
+    case NV097_INLINE_ARRAY:
+        k = s_gpu.inline_count;
+        i = n < NV_MAX_INLINE - k ? n : NV_MAX_INLINE - k;
+        memcpy(&s_gpu.inline_buf[k], params, i * 4);
+        s_gpu.inline_count = k + i;
+        break;
+    default:
+        return 0;
+    }
+    s_reg[(method & 0x1FFCu) / 4] = params[n - 1];
+    return 1;
 }
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)

@@ -1558,11 +1558,41 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+/* RECOMP_NV2A_KICK_SPIN=1: a thread of its own answers the kickoff flush
+ * (0x100410 bit 16) the moment it is set. The walker answers it every few
+ * commands, but while it is inside a draw the title's main thread spins on
+ * the bit -- 9 % of Ghost Recon 2's main thread with the frame limit off.
+ * Costs a host core spinning, so opt-in. */
+static DWORD WINAPI nv2a_kick_spin_thread(LPVOID param)
+{
+    volatile uint32_t *r = (volatile uint32_t *)((char *)param + 0x100410);
+    unsigned idle = 0;
+
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if (*r & 0x10000u) {
+            InterlockedAnd((volatile LONG *)r, ~0x10000);
+            idle = 0;
+        } else if (++idle < 4096) {
+            YieldProcessor();
+        } else {
+            idle = 0;
+            SwitchToThread();
+        }
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    {
+        const char *e = getenv("RECOMP_NV2A_KICK_SPIN");
+        if (e && atoi(e))
+            CloseHandle(CreateThread(NULL, 0, nv2a_kick_spin_thread,
+                                     g_nv2a_memory, 0, NULL));
+    }
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {

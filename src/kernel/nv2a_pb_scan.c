@@ -46,12 +46,14 @@ static uint32_t s_tot_calls;
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern int nv2a_pb_exec_bulk(uint32_t method, const uint32_t *params, uint32_t n);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
 
-/* Clears the NV2A request bits (xbox_memory_layout.c); called every 256
- * words while executing, so kickoffs are answered mid-walk. */
+/* Clears the NV2A request bits (xbox_memory_layout.c); called every 16
+ * words while executing, so kickoffs are answered mid-walk: every one of them
+ * is the title's main thread spinning until it is. */
 extern void xbox_Nv2aAckBusyBits(void);
 static uint32_t s_ack_tick;
 
@@ -99,6 +101,17 @@ static void note(uint32_t subch, uint32_t method)
         s_seen_count++;
         *slot = (uint16_t)s_seen_count;
     }
+}
+
+/* note() for a run of n words of one method. */
+static void note_n(uint32_t subch, uint32_t method, uint32_t n)
+{
+    uint16_t slot;
+
+    note(subch, method);
+    slot = s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
+    if (slot)
+        s_seen[slot - 1].count += n - 1;
 }
 
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to
@@ -336,7 +349,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         at = s_get;
 
         /* Keep answering kickoffs while executing; see xbox_Nv2aAckBusyBits. */
-        if (s_exec_enabled && (++s_ack_tick & 0xFFu) == 0)
+        if (s_exec_enabled && (++s_ack_tick & 0x0Fu) == 0)
             xbox_Nv2aAckBusyBits();
 
         if (s_get >= PB_RAM_BYTES) {
@@ -485,10 +498,40 @@ static int s_dry;                   /* decoding only: execute nothing */
 static void pb_seg_params(const uint8_t *mem, uint32_t *va, uint32_t end_va,
                           uint32_t *words)
 {
+    /* Runs of parameters in one step where the words themselves do not
+     * matter (the dry pass) or are plain data (indices, inline vertices):
+     * word by word, the walk was most of the executor thread's time and the
+     * frame rate's ceiling in Ghost Recon 2 play. */
+    if (s_seg_pend.left && *va != end_va) {
+        uint32_t off = *va & 0x0FFFFFFFu;
+        uint32_t room = off + 4 <= PB_RAM_BYTES ? (PB_RAM_BYTES - off) / 4 : 0;
+        uint32_t n = s_seg_pend.left;
+        if (n > room)
+            n = room;
+        if (end_va > *va && (end_va - *va) / 4 < n)
+            n = (end_va - *va) / 4;
+        if (n && s_dry) {
+            s_seg_pend.left -= n;
+            if (!s_seg_pend.noninc)
+                s_seg_pend.method += 4 * n;
+            *va += 4 * n;
+            *words += n;
+        } else if (n && s_exec_enabled && s_seg_pend.noninc && s_seg_pend.subch == 0
+                   && nv2a_pb_exec_bulk(s_seg_pend.method,
+                                        (const uint32_t *)(mem + *va), n)) {
+            note_n(0, s_seg_pend.method, n);
+            if (((s_ack_tick + n) ^ s_ack_tick) & ~0x0Fu)
+                xbox_Nv2aAckBusyBits();
+            s_ack_tick += n;
+            s_seg_pend.left -= n;
+            *va += 4 * n;
+            *words += n;
+        }
+    }
     while (s_seg_pend.left && *va != end_va
            && (*va & 0x0FFFFFFFu) + 4 <= PB_RAM_BYTES) {
         /* Answer kickoffs mid-walk; see pb_follow. */
-        if (!s_dry && s_exec_enabled && (++s_ack_tick & 0xFFu) == 0)
+        if (!s_dry && s_exec_enabled && (++s_ack_tick & 0x0Fu) == 0)
             xbox_Nv2aAckBusyBits();
         if (!s_dry)
             note(s_seg_pend.subch, s_seg_pend.method);
@@ -668,7 +711,7 @@ static int pb_follow(uint32_t from_phys, uint32_t put_phys, int dry)
          * decoded frame and spent 99 % of its time in that spin (sampled,
          * sub_0042F790): the cinematic ran at a frame a second and its audio
          * starved. The DMA walk always did this; the follow walk forgot. */
-        if (!dry && s_exec_enabled && (++s_ack_tick & 0xFFu) == 0)
+        if (!dry && s_exec_enabled && (++s_ack_tick & 0x0Fu) == 0)
             xbox_Nv2aAckBusyBits();
         if (va == start && words) {
             va = start + 4;                       /* round the ring: not a */

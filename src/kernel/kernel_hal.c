@@ -199,6 +199,66 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     }
 }
 
+/* DPCs against guest code at DISPATCH_LEVEL.
+ *
+ * On the console a DPC runs on the one processor, so a thread that raised to
+ * DISPATCH_LEVEL is never running while one does: that raise is how DirectSound
+ * guards the lists its timer DPC walks. Here the DPC runs on the timer thread
+ * beside the guest's, and the two met mid-edit -- Ghost Recon 2 faulted in its
+ * sound DPC on a half-unlinked entry (0x7FFFFF1E) during a heavy firefight.
+ *
+ * A gate rather than a lock, so a mis-paired raise cannot hang a thread: the
+ * DPC runner announces itself and goes ahead only with no thread raised; a
+ * thread that raises (count first, then the flag, both interlocked) waits out
+ * a DPC already running. */
+static volatile LONG g_dpc_running = 0;
+static RECOMP_TLS int t_in_dpc;
+
+static void dispatch_gate_wait(KIRQL old_level, KIRQL new_level)
+{
+    if (old_level >= DISPATCH_LEVEL || new_level < DISPATCH_LEVEL || t_in_dpc)
+        return;
+    while (InterlockedCompareExchange(&g_dpc_running, 0, 0))
+        SwitchToThread();
+}
+
+void xbox_DpcBegin(void)
+{
+    LARGE_INTEGER f, t0, t;
+    int forced = 0;
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        if (InterlockedCompareExchange(&g_dpc_running, 1, 0) == 0) {
+            if (forced || InterlockedCompareExchange(&g_irql_raised_count, 0, 0) == 0)
+                break;
+            InterlockedExchange(&g_dpc_running, 0);
+        }
+        QueryPerformanceCounter(&t);
+        if (!forced && (t.QuadPart - t0.QuadPart) * 1000 > f.QuadPart * 50) {
+            /* 50 ms raised is a raise that was never lowered, not a busy
+             * title: run rather than stop every DPC for good, and say so. */
+            static volatile LONG n;
+            forced = 1;
+            if (InterlockedIncrement(&n) <= 5) {
+                fprintf(stderr, "  [DPC] guest held DISPATCH_LEVEL 50 ms; "
+                                "running the DPC anyway\n");
+                xbox_IrqlDumpHolders();
+            }
+            continue;
+        }
+        SwitchToThread();
+    }
+    t_in_dpc = 1;
+}
+
+void xbox_DpcEnd(void)
+{
+    t_in_dpc = 0;
+    InterlockedExchange(&g_dpc_running, 0);
+}
+
 /* Bracket a host-delivered ISR or DPC.
  *
  * The kernel's interrupt and DPC dispatchers put the processor back at the
@@ -245,6 +305,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
     }
 
     irql_track(old, NewIrql, IRQL_CALLER());
+    dispatch_gate_wait(old, NewIrql);
     g_current_irql = NewIrql;
     irql_publish();
     return old;
@@ -294,6 +355,7 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
     KIRQL old = g_current_irql;
 
     irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
+    dispatch_gate_wait(old, DISPATCH_LEVEL);
     g_current_irql = DISPATCH_LEVEL;
     irql_publish();
     return old;
