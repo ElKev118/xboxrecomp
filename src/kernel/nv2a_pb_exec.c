@@ -3109,6 +3109,10 @@ static uint32_t prim_triangles(uint32_t n, uint32_t *tri)
     return k;
 }
 
+/* Bumped at every fence release the executor writes: the title may rewrite
+ * a buffer the GPU had read only after one (Nv2aBatchVsh.data_gen). */
+static uint32_t s_data_gen = 1;
+
 /* RECOMP_VK_RAW_VERTS=0: always fetch attributes on the CPU (dedup path). */
 static int raw_verts_enabled(void)
 {
@@ -3211,6 +3215,9 @@ static int build_raw_batch(Nv2aBatchVsh *b, const uint8_t *regs, uint32_t ni,
     for (i = 0; i < ntri; i++)
         tri[i] = s_gpu.idx[pos[i]] - lo;
     b->nverts = hi - lo + 1;
+    /* Reusable while no fence has been released since -- and only when the
+     * fences are this executor's own writes; inline data never. */
+    b->data_gen = (s_gpu.inline_active || !s_sem_va) ? 0 : s_data_gen;
     return 1;
 }
 
@@ -3647,8 +3654,15 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
-        fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
+    {
+        /* Progress line, RECOMP_NV2A_TRACE only: an unbuffered stderr write
+         * every 200 draws was 2.6 % of this thread in Ghost Recon 2 play. */
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_NV2A_TRACE") != NULL;
+        if (trace && (s_gpu.draws % 200) == 0)
+            fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
+    }
     s_gpu.verts += s_gpu.idx_count;
 
     /* How many batches carry coordinates at all, and what range they span.
@@ -4174,6 +4188,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
     if (subch == 0 && method == 0x1D70 && s_sem_va) {
+        s_data_gen++;                    /* the title may now rewrite buffers */
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         *(volatile uint32_t *)(mem + s_sem_va) = param;
         return;

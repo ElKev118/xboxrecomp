@@ -861,7 +861,7 @@ static int pb_follow(uint32_t from_phys, uint32_t put_phys, int dry)
  * the first walk. */
 void *g_pb_exec_thread;
 
-void nv2a_pb_scan_follow(uint32_t from_phys, uint32_t put_phys)
+static void pb_scan_follow(uint32_t from_phys, uint32_t put_phys)
 {
     PbPending saved;
 
@@ -897,4 +897,23 @@ void nv2a_pb_scan_follow(uint32_t from_phys, uint32_t put_phys)
     }
     s_seg_pend = saved;
     pb_follow(from_phys, put_phys, 0);
+}
+
+/* Time spent executing (performance counter ticks), for a back end to report
+ * how busy this thread really is: its idle loop spins, so thread CPU time
+ * does not tell work from waiting. */
+static volatile LONGLONG s_busy_qpc;
+
+long long nv2a_pb_busy_ticks(void)
+{
+    return s_busy_qpc;
+}
+
+void nv2a_pb_scan_follow(uint32_t from_phys, uint32_t put_phys)
+{
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    pb_scan_follow(from_phys, put_phys);
+    QueryPerformanceCounter(&b);
+    s_busy_qpc += b.QuadPart - a.QuadPart;
 }

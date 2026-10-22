@@ -221,6 +221,13 @@ typedef struct {
         uint32_t           bytes;
         uint32_t           stride;
     } stream[16];
+    /* Nonzero: the bytes at a stream's `data` stay as they are for as long
+     * as this value does, so a back end that already uploaded the same
+     * (data, bytes, data_gen) may reuse that copy. It changes whenever the
+     * title can have rewritten a buffer the GPU had read -- at every fence
+     * release, the only point the title may safely do so. 0 (vertices
+     * inline in the pushbuffer, in a buffer reused per batch): never reuse. */
+    uint32_t               data_gen;
     uint32_t               nattrs;
     struct {
         uint8_t            reg, stream, type, size;
