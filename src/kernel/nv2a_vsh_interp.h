@@ -63,4 +63,8 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
+/* The range of constants (program 0) or program slots (1) written since
+ * the last call, inclusive; returns 0 if none, and clears it. */
+int nv2a_vsh_take_dirty(int program, uint32_t *lo, uint32_t *hi);
+
 #endif

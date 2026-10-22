@@ -547,6 +547,506 @@ static uint32_t blit_2d_bpp(uint32_t format)
 
 static const Nv2aBackend *s_backend;   /* see the back-end section below */
 
+/* ---- Two-stage execution (RECOMP_PB_THREADS=2) ---------------------------
+ *
+ * The walk over the pushbuffer (this file) and the back end's work for each
+ * draw (recording Vulkan, uploading textures and vertices) used to share one
+ * thread, and together they were the frame rate's ceiling: in Ghost Recon 2
+ * play that thread was busy 96 % of the time while the title waited on it.
+ * Here the walk only describes what the back end must do, in a queue, and a
+ * second thread does it, so the two overlap.
+ *
+ * Everything a record needs is copied into it: the walk goes on rewriting
+ * its state (registers, index lists, the inline vertex buffer) for the next
+ * batch at once. Program memory and the constants travel as the ranges that
+ * changed (nv2a_vsh_take_dirty) into the second stage's own copy, as they
+ * would reach a GPU.
+ *
+ * What makes it safe is the order of the fence writes. The guest memory a
+ * draw reads -- vertex buffers, textures -- is read by the second stage, and
+ * later than before; the title may rewrite such memory only once a fence
+ * past the draw has been released. So releases (BACK_END_WRITE_SEMAPHORE_
+ * RELEASE) are queued too, and the second stage writes each one after
+ * everything before it is done: the title cannot see the release before the
+ * reads it guards have happened.
+ *
+ * The walk needs two answers from the back end, and gets them without
+ * waiting: whether a vertex-program batch can be drawn (vsh_accepts, a pure
+ * check) and whether it did a blit -- a 2D blit the back end declines is
+ * copied in guest memory by the second stage, in order, instead. */
+
+enum {
+    Q_PAD, Q_CONST, Q_PROG, Q_VSH, Q_XF, Q_DRAW, Q_CLEAR, Q_BLIT, Q_PRESENT,
+    Q_WRITE32
+};
+
+typedef struct { uint32_t type, size; } QHdr;     /* size: whole record */
+
+typedef struct {
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aPixelState px;
+    Nv2aBatchVsh b;
+    uint32_t inline_streams;                 /* streams whose bytes follow */
+} QVsh;
+
+typedef struct {
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aPixelState px;
+    uint32_t count;
+} QXf;
+
+typedef struct {
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aTexture tex;
+    uint32_t has_tex, count;
+} QDraw;
+
+typedef struct {
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    uint32_t flags, argb, zstencil;
+} QClear;
+
+typedef struct {
+    uint32_t src_va, src_pitch, dst_va, dst_pitch, sx, sy, dx, dy, w, h, bpp;
+} QBlit;
+
+typedef struct {
+    uint32_t va, pitch, w, h, aa_sx, aa_sy, aa_window, draws;
+} QPresent;
+
+#define Q_BYTES (64u << 20)
+static uint8_t *s_q;
+static volatile LONG64 s_qhead, s_qtail;      /* byte positions, ever growing */
+static uint64_t s_qnext;                      /* end of the record being built */
+static int s_defer = -1;
+static volatile LONG64 s_qwork_ticks, s_qwait_ticks;
+static float    s_wconst[NV2A_VSH_CONSTANTS][4];  /* the second stage's copies */
+static uint32_t s_wprog[NV2A_VSH_SLOTS][4];
+
+static void present_now(const QPresent *p);
+static void blit_guest_copy(const QBlit *a);
+
+static void q_run(const QHdr *h)
+{
+    const uint8_t *p = (const uint8_t *)(h + 1);
+
+    switch (h->type) {
+    case Q_CONST:
+    case Q_PROG: {
+        uint32_t lo, n;
+        memcpy(&lo, p, 4);
+        memcpy(&n, p + 4, 4);
+        if (h->type == Q_CONST)
+            memcpy(s_wconst[lo], p + 8, (size_t)n * 16);
+        else
+            memcpy(s_wprog[lo], p + 8, (size_t)n * 16);
+        break;
+    }
+    case Q_VSH: {
+        QVsh *r = (QVsh *)p;                  /* the record is ours to fix up */
+        const uint8_t *at = p + sizeof *r;
+        uint32_t k;
+        r->b.state = &r->rs;
+        r->b.pixel = &r->px;
+        r->b.constants = (const float (*)[4])s_wconst;
+        r->b.program = (const uint32_t (*)[4])s_wprog;
+        r->b.indices = (const uint32_t *)at;
+        at += (size_t)r->b.nindices * 4;
+        if (!r->b.raw) {
+            r->b.inputs = (const float *)at;
+            at += (size_t)r->b.nverts * r->b.ninputs * 16;
+        }
+        for (k = 0; k < r->b.nstreams; k++)
+            if (r->inline_streams & (1u << k)) {
+                r->b.stream[k].data = at;
+                at += (r->b.stream[k].bytes + 15u) & ~15u;
+            }
+        if (!s_backend->draw_vsh(&r->surf, &r->b)) {
+            static unsigned said;
+            if (said++ < 8)
+                fprintf(stderr, "  [PB] second stage: back end refused a vertex-program"
+                        " batch it had accepted (program %016llX) -- not drawn\n",
+                        (unsigned long long)r->b.program_hash);
+        }
+        break;
+    }
+    case Q_XF: {
+        const QXf *r = (const QXf *)p;
+        Nv2aBatchXf b;
+        b.vertices = (const Nv2aVertexXf *)(p + sizeof *r);
+        b.count = r->count;
+        b.state = &r->rs;
+        b.pixel = &r->px;
+        s_backend->draw_xf(&r->surf, &b);
+        break;
+    }
+    case Q_DRAW: {
+        const QDraw *r = (const QDraw *)p;
+        Nv2aBatch b;
+        b.vertices = (const Nv2aVertex *)(p + sizeof *r);
+        b.count = r->count;
+        b.texture = r->has_tex ? &r->tex : NULL;
+        b.state = &r->rs;
+        s_backend->draw(&r->surf, &b);
+        break;
+    }
+    case Q_CLEAR: {
+        const QClear *r = (const QClear *)p;
+        s_backend->clear(&r->surf, &r->rs, r->flags, r->argb, r->zstencil);
+        break;
+    }
+    case Q_BLIT: {
+        const QBlit *a = (const QBlit *)p;
+        if (!(s_backend->blit
+              && s_backend->blit(a->src_va, a->src_pitch, a->dst_va, a->dst_pitch,
+                                 a->sx, a->sy, a->dx, a->dy, a->w, a->h, a->bpp)))
+            blit_guest_copy(a);
+        break;
+    }
+    case Q_PRESENT:
+        present_now((const QPresent *)p);
+        break;
+    case Q_WRITE32: {
+        uint32_t va, v;
+        memcpy(&va, p, 4);
+        memcpy(&v, p + 4, 4);
+        *(volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static DWORD WINAPI q_worker(LPVOID unused)
+{
+    unsigned idle = 0;
+    (void)unused;
+    for (;;) {
+        uint64_t tail = (uint64_t)s_qtail;
+        uint64_t head = (uint64_t)InterlockedCompareExchange64(&s_qhead, 0, 0);
+        LARGE_INTEGER a, b;
+        if (tail == head) {
+            if (++idle < 2000)
+                YieldProcessor();
+            else if (idle < 4000)
+                SwitchToThread();
+            else
+                Sleep(0);
+            continue;
+        }
+        idle = 0;
+        QueryPerformanceCounter(&a);
+        while (tail != head) {
+            const QHdr *h = (const QHdr *)(s_q + tail % Q_BYTES);
+            q_run(h);
+            tail += h->size;
+            MemoryBarrier();
+            InterlockedExchange64(&s_qtail, (LONG64)tail);
+        }
+        QueryPerformanceCounter(&b);
+        InterlockedExchangeAdd64(&s_qwork_ticks, b.QuadPart - a.QuadPart);
+    }
+    return 0;
+}
+
+/* Executing time of the second stage and the first stage's waits for queue
+ * space, performance-counter ticks -- for a back end's stats line. */
+long long nv2a_pb_worker_ticks(void) { return s_qwork_ticks; }
+long long nv2a_pb_queue_wait_ticks(void) { return s_qwait_ticks; }
+
+static int defer_on(void)
+{
+    if (s_defer < 0) {
+        const char *e = getenv("RECOMP_PB_THREADS");
+        s_defer = 0;
+        if (e && atoi(e) >= 2 && s_backend) {
+            s_q = (uint8_t *)VirtualAlloc(NULL, Q_BYTES, MEM_COMMIT | MEM_RESERVE,
+                                          PAGE_READWRITE);
+            if (s_q && CreateThread(NULL, 0, q_worker, NULL, 0, NULL)) {
+                s_defer = 1;
+                fprintf(stderr, "  [PB] two-stage execution: the back end runs on a"
+                        " thread of its own (RECOMP_PB_THREADS=2)\n");
+            }
+        }
+    }
+    return s_defer;
+}
+
+static void q_wait_space(uint64_t head, uint32_t size)
+{
+    if (head + size - (uint64_t)InterlockedCompareExchange64(&s_qtail, 0, 0) <= Q_BYTES)
+        return;
+    {
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        while (head + size - (uint64_t)InterlockedCompareExchange64(&s_qtail, 0, 0) > Q_BYTES)
+            SwitchToThread();
+        QueryPerformanceCounter(&b);
+        s_qwait_ticks += b.QuadPart - a.QuadPart;
+    }
+}
+
+/* Space for a record of `payload` bytes; NULL when it could never fit. */
+static uint8_t *q_reserve(uint32_t type, size_t payload)
+{
+    uint64_t head = (uint64_t)s_qhead;
+    uint32_t off = (uint32_t)(head % Q_BYTES), size;
+    QHdr *h;
+
+    if (payload > Q_BYTES / 4)
+        return NULL;
+    size = (uint32_t)((sizeof(QHdr) + payload + 15u) & ~(size_t)15u);
+    if (off + size > Q_BYTES) {                /* to the end: pad and wrap */
+        uint32_t pad = Q_BYTES - off;
+        q_wait_space(head, pad);
+        h = (QHdr *)(s_q + off);
+        h->type = Q_PAD;
+        h->size = pad;
+        MemoryBarrier();
+        InterlockedExchange64(&s_qhead, (LONG64)(head + pad));
+        head += pad;
+        off = 0;
+    }
+    q_wait_space(head, size);
+    h = (QHdr *)(s_q + off);
+    h->type = type;
+    h->size = size;
+    s_qnext = head + size;
+    return (uint8_t *)(h + 1);
+}
+
+static void q_commit(void)
+{
+    MemoryBarrier();
+    InterlockedExchange64(&s_qhead, (LONG64)s_qnext);
+}
+
+/* Until the second stage has done everything queued: for the rare record
+ * too big for the queue, which is then run here. */
+static void q_drain(void)
+{
+    while ((uint64_t)InterlockedCompareExchange64(&s_qtail, 0, 0) != (uint64_t)s_qhead)
+        SwitchToThread();
+}
+
+/* Program memory and constants written since the last batch, to the second
+ * stage's copies. */
+static void q_vsh_state(void)
+{
+    int which;
+    for (which = 0; which < 2; which++) {
+        uint32_t lo, hi, n;
+        uint8_t *p;
+        if (!nv2a_vsh_take_dirty(which, &lo, &hi))
+            continue;
+        n = hi - lo + 1;
+        p = q_reserve(which ? Q_PROG : Q_CONST, 8 + (size_t)n * 16);
+        memcpy(p, &lo, 4);
+        memcpy(p + 4, &n, 4);
+        if (which)
+            memcpy(p + 8, nv2a_vsh_program(NULL, NULL)[lo], (size_t)n * 16);
+        else
+            memcpy(p + 8, nv2a_vsh_constants()[lo], (size_t)n * 16);
+        q_commit();
+    }
+}
+
+/* ---- the back-end calls, direct or through the queue -------------------- */
+
+static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
+                     uint32_t flags, uint32_t argb, uint32_t zs)
+{
+    QClear *r;
+    if (!defer_on()) {
+        s_backend->clear(s, rs, flags, argb, zs);
+        return;
+    }
+    r = (QClear *)q_reserve(Q_CLEAR, sizeof *r);
+    r->surf = *s;
+    r->rs = *rs;
+    r->flags = flags;
+    r->argb = argb;
+    r->zstencil = zs;
+    q_commit();
+}
+
+static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    QDraw *r;
+    if (defer_on())
+        r = (QDraw *)q_reserve(Q_DRAW, sizeof *r + (size_t)b->count * sizeof(Nv2aVertex));
+    else
+        r = NULL;
+    if (!r) {
+        if (s_defer > 0)
+            q_drain();
+        s_backend->draw(s, b);
+        return;
+    }
+    r->surf = *s;
+    r->rs = *b->state;
+    r->has_tex = b->texture != NULL;
+    if (b->texture)
+        r->tex = *b->texture;
+    r->count = b->count;
+    memcpy(r + 1, b->vertices, (size_t)b->count * sizeof(Nv2aVertex));
+    q_commit();
+}
+
+static void be_draw_xf(const Nv2aSurface *s, const Nv2aBatchXf *b)
+{
+    QXf *r;
+    if (defer_on())
+        r = (QXf *)q_reserve(Q_XF, sizeof *r + (size_t)b->count * sizeof(Nv2aVertexXf));
+    else
+        r = NULL;
+    if (!r) {
+        if (s_defer > 0)
+            q_drain();
+        s_backend->draw_xf(s, b);
+        return;
+    }
+    r->surf = *s;
+    r->rs = *b->state;
+    r->px = *b->pixel;
+    r->count = b->count;
+    memcpy(r + 1, b->vertices, (size_t)b->count * sizeof(Nv2aVertexXf));
+    q_commit();
+}
+
+static int be_draw_vsh(const Nv2aSurface *s, const Nv2aBatchVsh *b)
+{
+    const uint8_t *ib = (const uint8_t *)s_gpu.inline_buf;
+    size_t bytes = sizeof(QVsh) + (size_t)b->nindices * 4, inl = 0;
+    uint32_t k, mask = 0;
+    QVsh *r;
+    uint8_t *at;
+
+    if (!defer_on())
+        return s_backend->draw_vsh(s, b);
+    if (s_backend->vsh_accepts && !s_backend->vsh_accepts(b))
+        return 0;
+    if (!b->raw)
+        bytes += (size_t)b->nverts * b->ninputs * 16;
+    else
+        for (k = 0; k < b->nstreams; k++)
+            if (b->stream[k].data >= ib && b->stream[k].data < ib + sizeof s_gpu.inline_buf) {
+                mask |= 1u << k;
+                inl += (b->stream[k].bytes + 15u) & ~15u;
+            }
+    q_vsh_state();
+    r = (QVsh *)q_reserve(Q_VSH, bytes + inl);
+    if (!r) {
+        q_drain();
+        memcpy(s_wconst, nv2a_vsh_constants(), sizeof s_wconst);
+        memcpy(s_wprog, nv2a_vsh_program(NULL, NULL), sizeof s_wprog);
+        return s_backend->draw_vsh(s, b);
+    }
+    r->surf = *s;
+    r->rs = *b->state;
+    r->px = *b->pixel;
+    r->b = *b;
+    r->inline_streams = mask;
+    at = (uint8_t *)(r + 1);
+    memcpy(at, b->indices, (size_t)b->nindices * 4);
+    at += (size_t)b->nindices * 4;
+    if (!b->raw) {
+        memcpy(at, b->inputs, (size_t)b->nverts * b->ninputs * 16);
+        at += (size_t)b->nverts * b->ninputs * 16;
+    }
+    for (k = 0; k < b->nstreams; k++)
+        if (mask & (1u << k)) {
+            memcpy(at, b->stream[k].data, b->stream[k].bytes);
+            at += (b->stream[k].bytes + 15u) & ~15u;
+        }
+    q_commit();
+    return 1;
+}
+
+/* 1 if handled here (queued, or done by the back end); 0: the caller copies
+ * guest memory itself, as before. */
+static int be_blit(const QBlit *a)
+{
+    QBlit *r;
+    if (!defer_on())
+        return s_backend->blit
+            && s_backend->blit(a->src_va, a->src_pitch, a->dst_va, a->dst_pitch,
+                               a->sx, a->sy, a->dx, a->dy, a->w, a->h, a->bpp);
+    r = (QBlit *)q_reserve(Q_BLIT, sizeof *r);
+    *r = *a;
+    q_commit();
+    return 1;
+}
+
+static void be_present(const QPresent *a)
+{
+    QPresent *r;
+    if (!defer_on()) {
+        present_now(a);
+        return;
+    }
+    r = (QPresent *)q_reserve(Q_PRESENT, sizeof *r);
+    *r = *a;
+    q_commit();
+}
+
+/* A semaphore release: written now, or by the second stage once all that
+ * was queued before it is done (see the top of this section). */
+static void be_write32(uint32_t va, uint32_t v)
+{
+    uint8_t *p;
+    if (!defer_on()) {
+        *(volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+        return;
+    }
+    p = q_reserve(Q_WRITE32, 8);
+    memcpy(p, &va, 4);
+    memcpy(p + 4, &v, 4);
+    q_commit();
+}
+
+/* The flip's hand-over to the back end and the window, and the flip. */
+static void present_now(const QPresent *p)
+{
+    extern void xbox_FramebufferWindowFrameStats(uint32_t);
+    extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+
+    xbox_FramebufferWindowFrameStats(p->draws);
+    if (p->va) {
+        if (s_backend && s_backend->present)
+            s_backend->present(p->va, p->pitch, p->w, p->h, p->aa_sx, p->aa_sy);
+        xbox_FramebufferWindowSet(p->va, p->pitch);
+        xbox_FramebufferWindowSetAA(p->aa_window);
+        xbox_FramebufferWindowPresent(p->va, p->pitch);
+    }
+    if (s_backend && s_backend->flip)
+        s_backend->flip();
+}
+
+/* A 2D SRCCOPY in guest memory, for a blit the back end did not do. */
+static void blit_guest_copy(const QBlit *a)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t src = a->src_va + a->sy * a->src_pitch + a->sx * a->bpp;
+    uint32_t dst = a->dst_va + a->dy * a->dst_pitch + a->dx * a->bpp, y;
+
+    if (!guest_span_ok(src, (a->h - 1) * a->src_pitch + a->w * a->bpp)
+        || !guest_span_ok(dst, (a->h - 1) * a->dst_pitch + a->w * a->bpp)
+        || surface_hits_image(dst, (a->h - 1) * a->dst_pitch + a->w * a->bpp)) {
+        surface_write_refused(dst, (a->h - 1) * a->dst_pitch + a->w * a->bpp, "2D blit");
+        return;
+    }
+    for (y = 0; y < a->h; y++)
+        memmove(mem + dst + (size_t)y * a->dst_pitch, mem + src + (size_t)y * a->src_pitch,
+                (size_t)a->w * a->bpp);
+}
+
+
 static void blit_2d_run(uint32_t size)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -572,19 +1072,16 @@ static void blit_2d_run(uint32_t size)
                 "%08X+%u,%u (pitch %u)  [%08X -> %08X]\n", w, h, s_2d.format,
                 s_2d.src, sx, sy, spitch, s_2d.dst, dx, dy, dpitch, src, dst);
     }
-    if (s_backend && s_backend->blit
-        && s_backend->blit(dma_resolve(s_2d.src), spitch, dma_resolve(s_2d.dst),
-                           dpitch, sx, sy, dx, dy, w, h, bpp))
-        return;
-    if (!guest_span_ok(src, (h - 1) * spitch + w * bpp)
-        || !guest_span_ok(dst, (h - 1) * dpitch + w * bpp)
-        || surface_hits_image(dst, (h - 1) * dpitch + w * bpp)) {
-        surface_write_refused(dst, (h - 1) * dpitch + w * bpp, "2D blit");
-        return;
+    {
+        QBlit a;
+        a.src_va = dma_resolve(s_2d.src); a.src_pitch = spitch;
+        a.dst_va = dma_resolve(s_2d.dst); a.dst_pitch = dpitch;
+        a.sx = sx; a.sy = sy; a.dx = dx; a.dy = dy; a.w = w; a.h = h; a.bpp = bpp;
+        if (s_backend && be_blit(&a))
+            return;
+        blit_guest_copy(&a);
     }
-    for (y = 0; y < h; y++)
-        memmove(mem + dst + (size_t)y * dpitch, mem + src + (size_t)y * spitch,
-                (size_t)w * bpp);
+    (void)mem; (void)y;
 }
 
 /* 1 if the method was the 2D engine's. */
@@ -935,11 +1432,12 @@ static void current_render_state(Nv2aRenderState *r)
     }
 }
 
-static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+static int sample_tex(const Texture *t, uint32_t face_offset,
+                      uint32_t u, uint32_t v, uint32_t *argb);
 
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
 {
-    Texture saved = s_gpu.texs[0];
+    Texture t;
     uint32_t x, y;
     int ok = 1;
 
@@ -973,25 +1471,30 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
         }
     }
 
-    s_gpu.texs[0].offset = tex->offset;
-    s_gpu.texs[0].width  = tex->width;
-    s_gpu.texs[0].height = tex->height;
-    s_gpu.texs[0].pitch  = tex->pitch;
-    s_gpu.texs[0].color  = tex->color;
-    s_gpu.texs[0].addr_u = 3;
-    s_gpu.texs[0].addr_v = 3;
-    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
-    s_gpu.texs[0].levels = 1;
-    s_gpu.texs[0].filter = 0;
-    s_gpu.texs[0].cube   = 0;
-    s_gpu.texs[0].valid  = 1;
+    /* A texture of its own for the sampler. This borrowed texture stage 0
+     * of the live state and put it back afterwards -- harmless on one
+     * thread, and on the back end's own thread (two-stage execution) it
+     * swapped the stage under the walk building the next batch, which then
+     * drew bodies and glyphs with some other texture. */
+    memset(&t, 0, sizeof t);
+    t.offset = tex->offset;
+    t.width  = tex->width;
+    t.height = tex->height;
+    t.pitch  = tex->pitch;
+    t.color  = tex->color;
+    t.addr_u = 3;
+    t.addr_v = 3;
+    t.palette = 0;                      /* ponytail: no palettised formats */
+    t.levels = 1;
+    t.filter = 0;
+    t.cube   = 0;
+    t.valid  = 1;
     for (y = 0; y < tex->height && ok; y++)
         for (x = 0; x < tex->width; x++)
-            if (!sample_texture(x, y, &argb_out[(size_t)y * tex->width + x])) {
+            if (!sample_tex(&t, 0, x, y, &argb_out[(size_t)y * tex->width + x])) {
                 ok = 0;
                 break;
             }
-    s_gpu.texs[0] = saved;
     return ok;
 }
 
@@ -1011,8 +1514,7 @@ static void clear_surface(uint32_t param)
             return;
         current_surface(&surf);
         current_render_state(&rs);
-        s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
-                         s_gpu.zstencil_clear);
+        be_clear(&surf, &rs, param, s_gpu.clear_color, s_gpu.zstencil_clear);
         s_gpu.clears++;
         return;
     }
@@ -2119,7 +2621,7 @@ static void backend_flush(int textured)
         tex.filter = s_gpu.texs[0].filter;
         batch.texture = &tex;
     }
-    s_backend->draw(&surf, &batch);
+    be_draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
     s_bcount = 0;
     note_drawn();
@@ -2942,7 +3444,7 @@ static void backend_xf_flush(void)
     batch.count = s_xcount;
     batch.state = &rs;
     batch.pixel = &px;
-    s_backend->draw_xf(&surf, &batch);
+    be_draw_xf(&surf, &batch);
     s_gpu.tris_drawn += s_xcount / 3;
     s_xcount = 0;
     note_drawn();
@@ -3317,7 +3819,7 @@ static int raster_batch_gpu_vsh(void)
                 return 1;                      /* no whole triangle */
             b.indices = tri;
             b.nindices = ntri;
-            if (s_backend->draw_vsh(&surf, &b))
+            if (be_draw_vsh(&surf, &b))
                 goto drawn;
         }
         b.raw = 0;
@@ -3369,7 +3871,7 @@ static int raster_batch_gpu_vsh(void)
     b.nverts = nv;
     b.indices = tri;
     b.nindices = ntri;
-    if (!s_backend->draw_vsh(&surf, &b))
+    if (!be_draw_vsh(&surf, &b))
         return 0;
 drawn:
     s_gpu.batches_program++;
@@ -4244,8 +4746,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * held 0xFF000000 at times, which put the write outside guest memory). */
     if (subch == 0 && method == 0x1D70 && s_sem_va) {
         s_data_gen++;                    /* the title may now rewrite buffers */
-        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-        *(volatile uint32_t *)(mem + s_sem_va) = param;
+        be_write32(s_sem_va, param);
         return;
     }
     if (!inited) {
@@ -4557,10 +5058,27 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * clock, is what stops it showing a surface the rasteriser is still
          * writing. */
         {
-            extern void xbox_FramebufferWindowFrameStats(uint32_t);
+            /* Handed over now, in order with the draws: the frame's stats,
+             * the surface to show, and the flip (present_now). */
             static uint32_t draws_at_flip;
-            xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
+            QPresent pr;
+            memset(&pr, 0, sizeof pr);
+            pr.draws = s_gpu.draws - draws_at_flip;
             draws_at_flip = s_gpu.draws;
+            if (s_gpu.pitch) {
+                uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                                   : s_gpu.color_offset;
+                if (done) {
+                    pr.va = dma_resolve(done);
+                    pr.pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
+                    pr.w = s_gpu.drawn_offset ? s_gpu.drawn_w : s_gpu.clip_w;
+                    pr.h = s_gpu.drawn_offset ? s_gpu.drawn_h : s_gpu.clip_h;
+                    pr.aa_sx = s_gpu.aa_sx > 1.5f ? 2 : 1;
+                    pr.aa_sy = s_gpu.aa_sy > 1.5f ? 2 : 1;
+                    pr.aa_window = pr.aa_sy;
+                }
+            }
+            be_present(&pr);
         }
         {
             /* RECOMP_DUMP_TEX_AT=va,w,h,fmt[,every]: at every <every>-th flip
@@ -4601,24 +5119,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 free(px);
             }
         }
-        if (s_gpu.pitch) {
-            extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
-            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
-                                               : s_gpu.color_offset;
-            uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
-                                                : s_gpu.pitch;
-            if (done && s_backend && s_backend->present)
-                s_backend->present(dma_resolve(done), pitch,
-                                   s_gpu.drawn_offset ? s_gpu.drawn_w : s_gpu.clip_w,
-                                   s_gpu.drawn_offset ? s_gpu.drawn_h : s_gpu.clip_h,
-                                   s_gpu.aa_sx > 1.5f ? 2 : 1,
-                                   s_gpu.aa_sy > 1.5f ? 2 : 1);
-            if (done) {
-                xbox_FramebufferWindowSet(dma_resolve(done), pitch);
-                xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
-                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-            }
-        }
         {
             /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
              * report -- a consecutive sequence, which is what a headless
@@ -4641,8 +5141,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         s_gpu.drawn_stale = 1;
-        if (s_backend && s_backend->flip)
-            s_backend->flip();
 
         if (verbose) {
             static unsigned n;

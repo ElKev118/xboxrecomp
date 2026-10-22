@@ -41,6 +41,30 @@ static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
 static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
 
+/* What changed since nv2a_vsh_take_dirty last asked, as an inclusive range
+ * (lo > hi: nothing), for a consumer that keeps its own copy of program
+ * memory and the constants -- the executor's second stage, which must not
+ * read these arrays while the first stage writes the next batch's. Starts
+ * as everything. */
+static uint32_t s_cdirty_lo = 0, s_cdirty_hi = NV2A_VSH_CONSTANTS - 1;
+static uint32_t s_pdirty_lo = 0, s_pdirty_hi = NV2A_VSH_SLOTS - 1;
+#define DIRTY(lo, hi, i) do { if ((lo) > (hi)) { (lo) = (hi) = (i); } \
+                              else { if ((i) < (lo)) (lo) = (i); \
+                                     if ((i) > (hi)) (hi) = (i); } } while (0)
+
+int nv2a_vsh_take_dirty(int program, uint32_t *lo, uint32_t *hi)
+{
+    uint32_t *l = program ? &s_pdirty_lo : &s_cdirty_lo;
+    uint32_t *h = program ? &s_pdirty_hi : &s_cdirty_hi;
+    if (*l > *h)
+        return 0;
+    *lo = *l;
+    *hi = *h;
+    *l = 0xFFFFFFFFu;
+    *h = 0;
+    return 1;
+}
+
 static int vsh_dump_enabled(void)
 {
     if (s_const_trace < 0)
@@ -63,8 +87,10 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 
 void nv2a_vsh_program_word(uint32_t word)
 {
-    if (s_load_slot < NV2A_VSH_SLOTS)
+    if (s_load_slot < NV2A_VSH_SLOTS) {
         s_program[s_load_slot][s_load_word] = word;
+        DIRTY(s_pdirty_lo, s_pdirty_hi, s_load_slot);
+    }
     if (++s_load_word == 4) {
         s_load_word = 0;
         s_load_slot++;
@@ -84,9 +110,10 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
-    if (s_const_load < NV2A_VSH_CONSTANTS)
+    if (s_const_load < NV2A_VSH_CONSTANTS) {
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
-    else if (vsh_dump_enabled()) {
+        DIRTY(s_cdirty_lo, s_cdirty_hi, s_const_load);
+    } else if (vsh_dump_enabled()) {
         static int warned;
         if (warned++ < 8)
             fprintf(stderr, "  [VSH] constant write DROPPED (c[%u] >= %u)\n",
@@ -108,14 +135,18 @@ void nv2a_vsh_constant_word(uint32_t word)
 
 void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
-    if (index < NV2A_VSH_CONSTANTS)
+    if (index < NV2A_VSH_CONSTANTS) {
         memcpy(s_const[index], v, sizeof s_const[index]);
+        DIRTY(s_cdirty_lo, s_cdirty_hi, index);
+    }
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
-    if (slot < NV2A_VSH_SLOTS)
+    if (slot < NV2A_VSH_SLOTS) {
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+        DIRTY(s_pdirty_lo, s_pdirty_hi, slot);
+    }
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
@@ -202,8 +233,10 @@ const float *nv2a_vsh_constant(uint32_t index)
 
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
-    if (index < NV2A_VSH_CONSTANTS && comp < 4)
+    if (index < NV2A_VSH_CONSTANTS && comp < 4) {
         memcpy(&s_const[index][comp], &word, 4);
+        DIRTY(s_cdirty_lo, s_cdirty_hi, index);
+    }
 }
 
 /* ---- execution ----------------------------------------------------------- */
@@ -413,8 +446,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         if (omask) {
             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[oaddr], src, omask);
+                    DIRTY(s_cdirty_lo, s_cdirty_hi, oaddr);
+                }
             } else if (oaddr == 0) {
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {

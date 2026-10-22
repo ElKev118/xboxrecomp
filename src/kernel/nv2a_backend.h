@@ -259,6 +259,11 @@ typedef struct {
     /* Optional: run vertex programs on the GPU (Nv2aBatchVsh). Returns 1 if
      * drawn; 0 sends the batch down the CPU path (draw_xf) instead. */
     int  (*draw_vsh)(const Nv2aSurface *s, const Nv2aBatchVsh *b);
+    /* Optional: whether draw_vsh would take this batch, answered without
+     * touching the back end's state (any thread). With two-stage
+     * execution (RECOMP_PB_THREADS=2) draw_vsh runs later, on another
+     * thread, so the executor decides on the CPU path from this. */
+    int  (*vsh_accepts)(const Nv2aBatchVsh *b);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
