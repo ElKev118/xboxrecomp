@@ -1355,6 +1355,49 @@ static void framebuffer_probe_tick(void)
  * and a level load, thousands of kickoffs long, looked frozen. Clearing them
  * from inside the walk answers the kickoff within a few hundred commands,
  * without a thread of its own spinning on a host core. */
+/* A vblank in flight: from the tick raising it until its deferred routine has
+ * run, PMC_INTR_0's PCRTC bit and PCRTC_INTR_0's vblank bit are real pending
+ * interrupts, not stale RAM. D3D's ISR only queues the DPC; the DPC reads
+ * PMC_INTR_0 again to learn what to service and counts the vblank only if the
+ * PCRTC bit is still there. Cleared from this thread in between -- and with
+ * the kick spin it runs continuously -- about every other vblank went
+ * uncounted: Ghost Recon 2's device count ran at 30 Hz against a 60 Hz tick,
+ * and the XMV player, which shows each frame when that count reaches its
+ * time, fell further behind its audio with every block until the sound
+ * stopped for seconds at a time.
+ *
+ * The hold is a QPC deadline rather than a flag: a title that acknowledges
+ * by writing the bit back and spinning until it clears still sees it clear,
+ * a couple of milliseconds late. 0 = nothing held. */
+static volatile LONG64 s_vblank_hold_until;
+
+void xbox_Nv2aHoldVblankIrq(int on)
+{
+    LARGE_INTEGER now, f;
+    if (!on) {
+        s_vblank_hold_until = 0;
+        return;
+    }
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&f);
+    s_vblank_hold_until = now.QuadPart + f.QuadPart / 500;   /* 2 ms */
+}
+
+static uint32_t vblank_held_bits(uint32_t offset)
+{
+    LONG64 until = s_vblank_hold_until;
+    LARGE_INTEGER now;
+
+    if (!until)
+        return 0;
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart >= until)
+        return 0;
+    if (offset == 0x000100) return 1u << 24;   /* PMC_INTR_0: PCRTC */
+    if (offset == 0x600100) return 1u << 0;    /* PCRTC_INTR_0: vblank */
+    return 0;
+}
+
 void xbox_Nv2aAckBusyBits(void)
 {
     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
@@ -1364,9 +1407,9 @@ void xbox_Nv2aAckBusyBits(void)
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-        if (*r & NV2A_ACK[i].busy_mask) {
-            *r &= ~NV2A_ACK[i].busy_mask;
-        }
+        uint32_t mask = NV2A_ACK[i].busy_mask;
+        if ((*r & mask) && (mask &= ~vblank_held_bits(NV2A_ACK[i].offset)))
+            *r &= ~mask;
     }
 }
 

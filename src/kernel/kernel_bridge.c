@@ -2727,6 +2727,8 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_VECTOR            3u
 
 static volatile LONG g_vblank_total;
+extern void xbox_Nv2aHoldVblankIrq(int on);   /* xbox_memory_layout.c */
+static volatile LONG g_vbl_declined;   /* RECOMP_VBLANK_PROBE */
 
 uint32_t xbox_VblankCount(void)
 {
@@ -2767,16 +2769,41 @@ static void kernel_vblank_tick(void)
     if (now.QuadPart - next.QuadPart > period * 4)   /* far behind: resync */
         next.QuadPart = now.QuadPart + period;
     InterlockedIncrement(&g_vblank_total);
+    {
+        /* RECOMP_VBLANK_PROBE=va: once a second, the vblanks raised against
+         * the title's own count, read from [[va]+0x1DE8] (D3D's device). */
+        static int probe = -1;
+        static uint32_t pva;
+        static LARGE_INTEGER t0;
+        if (probe < 0) {
+            const char *s = getenv("RECOMP_VBLANK_PROBE");
+            pva = s ? (uint32_t)strtoul(s, NULL, 0) : 0;
+            probe = pva != 0;
+            t0 = now;
+        }
+        if (probe && (g_vblank_total % 60) == 0) {
+            uint32_t dev = BRIDGE_MEM32(pva);
+            fprintf(stderr, "[VBL] ms=%lld raised=%ld declined=%ld dev=%u\n",
+                    (now.QuadPart - t0.QuadPart) * 1000 / freq.QuadPart,
+                    (long)g_vblank_total, (long)g_vbl_declined,
+                    dev ? BRIDGE_MEM32(dev + 0x1DE8) : 0);
+        }
+    }
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
+    /* Pending until the DPC the ISR queues has looked at it: released by the
+     * timer loop once kernel_drain_dpcs has run (xbox_Nv2aHoldVblankIrq). */
+    xbox_Nv2aHoldVblankIrq(1);
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
     {
         static unsigned n;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        if (claimed <= 0)
+            InterlockedIncrement(&g_vbl_declined);
         if (n++ < 3)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
@@ -3077,6 +3104,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         Sleep(1);
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
+        xbox_Nv2aHoldVblankIrq(0);
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -4035,6 +4063,25 @@ static void bridge_NtReadFile(void)
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+        {
+            /* RECOMP_READ_STACK=1: the guest code addresses on the stack
+             * above the read -- which part of the title asked for it. */
+            static int st = -1;
+            if (st < 0)
+                st = getenv("RECOMP_READ_STACK") != NULL;
+            if (st && poff) {
+                uint32_t k, shown = 0;
+                fprintf(stderr, "  [READ-STACK]");
+                for (k = 0; k < 256 && shown < 10; k++) {
+                    uint32_t v = BRIDGE_MEM32(g_esp + k * 4);
+                    if (v >= 0x00011000u && v < 0x00520000u) {
+                        fprintf(stderr, " %08X", v);
+                        shown++;
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         fflush(stderr);
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
