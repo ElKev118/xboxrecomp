@@ -230,7 +230,7 @@ static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], in
         g_lfe    = env_gain("RECOMP_APU_GAIN_LFE", 0.35f);
         g_back   = env_gain("RECOMP_APU_GAIN_BACK", 0.707f);
         g_3d     = env_gain("RECOMP_APU_GAIN_3D", 1.0f);
-        g_rev    = env_gain("RECOMP_APU_GAIN_REVERB", 0.10f);
+        g_rev    = env_gain("RECOMP_APU_GAIN_REVERB", 0.08f);
         g_fx     = env_gain("RECOMP_APU_GAIN_FX", 0.25f);
         init = 1;
     }
