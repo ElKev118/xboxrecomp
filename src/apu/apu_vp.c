@@ -286,6 +286,53 @@ static unsigned ba_voices(uint32_t ba)
     return 0;
 }
 
+/* Level of those voices (the port's "Ambience" setting, RECOMP_APU_GAIN_DENSE
+ * at start, default 0.6): the rain sat loud over the squad's speech. */
+static volatile float s_dense_gain = -1.0f;
+
+void xbox_AudioSetAmbience(float gain)
+{
+    s_dense_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain;
+}
+
+float xbox_AudioGetAmbience(void)
+{
+    if (s_dense_gain < 0.0f) {
+        const char *e = getenv("RECOMP_APU_GAIN_DENSE");
+        s_dense_gain = e && *e ? (float)atof(e) : 0.6f;
+    }
+    return s_dense_gain;
+}
+
+/* Each 3D voice slot delays those voices by its own fixed 0-20 ms
+ * (RECOMP_APU_DENSE_DELAY=0 turns it off). The title starts the drops on a
+ * 16 ms tick; shifting each slot by a different amount scatters them, which
+ * leaves less of the comb for the HRIR to break up. The line is fed all the
+ * time, so a voice turning dense reads real history. */
+#define DENSE_DL_LEN 1024
+static float s_dl[MCPX_HW_MAX_3D_VOICES][DENSE_DL_LEN];
+static unsigned s_dl_pos[MCPX_HW_MAX_3D_VOICES];
+
+static void dense_delay(uint16_t v, float samples[][2], bool dense)
+{
+    static int on = -1;
+    unsigned delay, i;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_DENSE_DELAY");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    if (!on) return;
+    delay = ((v * 2654435761u) >> 16) % 960;          /* 0..20 ms at 48 kHz */
+    for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        unsigned w = s_dl_pos[v];
+        s_dl[v][w] = samples[i][0];
+        if (dense)
+            samples[i][0] = samples[i][1] =
+                s_dl[v][(w + DENSE_DL_LEN - delay) % DENSE_DL_LEN];
+        s_dl_pos[v] = (w + 1) % DENSE_DL_LEN;
+    }
+}
+
 /* Each voice's gain on each of its 8 outputs as last mixed, and the frame it
  * was mixed in (the volume ramp in voice_process). */
 static float s_gain[MCPX_HW_MAX_VOICES][8];
@@ -1863,6 +1910,12 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    /* A 3D voice fed by a sample many voices are playing (the rain). */
+    bool dense = v < MCPX_HW_MAX_3D_VOICES && multipass && s_3d_src_ba[v] &&
+                 ba_voices(s_3d_src_ba[v]) >= APU_DENSE_VOICES;
+    if (multipass && v < MCPX_HW_MAX_3D_VOICES)
+        dense_delay(v, samples, dense);
+
     /* HRTF processing for 3D voices */
     if (v < MCPX_HW_MAX_3D_VOICES && apu_hrtf_mode() != APU_HRTF_OFF) {
         uint16_t hrtf_handle =
@@ -1871,9 +1924,7 @@ static void voice_process(MCPXAPUState *d,
         if (hrtf_handle != HRTF_NULL_HANDLE) {
             int mode = apu_hrtf_mode();
             if (mode == APU_HRTF_DENSE)
-                mode = multipass && s_3d_src_ba[v] &&
-                       ba_voices(s_3d_src_ba[v]) >= APU_DENSE_VOICES
-                       ? APU_HRTF_FULL : APU_HRTF_OFF;
+                mode = dense ? APU_HRTF_FULL : APU_HRTF_OFF;
             if (s_vstat_on > 0 && mode != APU_HRTF_OFF)
                 s_vstat[v].hrtf++;
             if (mode == APU_HRTF_FULL)
@@ -1893,6 +1944,8 @@ static void voice_process(MCPXAPUState *d,
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
+        if (dense)
+            g *= xbox_AudioGetAmbience();
         {
             /* Ramp from the gain this voice had on this output last frame to
              * the new one, across the frame, instead of stepping to it. The
