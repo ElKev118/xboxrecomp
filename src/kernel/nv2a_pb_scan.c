@@ -722,6 +722,13 @@ static int pb_in_ring(uint32_t phys)
     return s_ring_hi && phys + 0x10000u >= s_ring_lo && phys <= s_ring_hi + 0x10000u;
 }
 
+/* The JUMPs a dry walk took, printed when it finds no path: which one led
+ * away from PUT (a ring JUMP taken for a recorded buffer, a return to the
+ * wrong call site). */
+#define PB_JUMP_LOG 48
+typedef struct { uint32_t at, target; uint8_t in_rec, in_ring; } PbJump;
+static PbJump s_jump_log[PB_JUMP_LOG];
+
 static int pb_follow(uint32_t from_phys, uint32_t put_phys, int dry)
 {
     /* A recorded pushbuffer (D3D RunPushBuffer) is entered by a JUMP from
@@ -773,6 +780,10 @@ static int pb_follow(uint32_t from_phys, uint32_t put_phys, int dry)
                                              : (w & 0x1FFFFFFCu);
             if ((target & 0x0FFFFFFFu) >= PB_RAM_BYTES)
                 break;                            /* data read as a JUMP */
+            if (dry && jumps < PB_JUMP_LOG)       /* for a lost path's report */
+                s_jump_log[jumps] = (PbJump){ (va - 4) & PB_PHYS_MASK,
+                                              target & PB_PHYS_MASK, (uint8_t)in_rec,
+                                              (uint8_t)pb_in_ring(target) };
             jumps++;
             if (!in_rec && !pb_in_ring(target)) {
                 in_rec = 1;                       /* into a recorded buffer */
@@ -826,11 +837,30 @@ static int pb_follow(uint32_t from_phys, uint32_t put_phys, int dry)
     if (va != end) {
         if (dry) {
             static unsigned said_dry;
-            if (said_dry++ < 6) {
+            if (said_dry++ < 12) {
                 fprintf(stderr, "  [PB] dry walk %08X -> %08X stopped at %08X"
                         " (%u words, %u jumps, %u unknown)%s\n", from_phys, put_phys,
                         va & 0x0FFFFFFFu, words, jumps, unknown,
                         va == start + 4 ? " -- came round to the start" : "");
+                fprintf(stderr, "  [PB]   ring %08X..%08X; jumps (at->target rec/ring):",
+                        s_ring_lo, s_ring_hi);
+                for (uint32_t j = 0; j < jumps && j < PB_JUMP_LOG; j++)
+                    fprintf(stderr, " %X->%X%s%s", s_jump_log[j].at, s_jump_log[j].target,
+                            s_jump_log[j].in_rec ? "r" : "", s_jump_log[j].in_ring ? "" : "*");
+                fprintf(stderr, "\n");
+                /* The ring around each JUMP out to a recorded buffer: the
+                 * words D3D leaves after it (its gap and return address) are
+                 * what the return logic reads. */
+                for (uint32_t j = 0; j < jumps && j < PB_JUMP_LOG; j++) {
+                    uint32_t a = s_jump_log[j].at, k;
+                    if (s_jump_log[j].in_rec || s_jump_log[j].in_ring)
+                        continue;
+                    fprintf(stderr, "  [PB]   at %08X:", a);
+                    for (k = 0; k < 10; k++)
+                        fprintf(stderr, " %08X",
+                                *(const uint32_t *)(mem + (0x80000000u | (a + k * 4))));
+                    fprintf(stderr, "\n");
+                }
                 nv2a_pb_segment_dump();
             }
         }
@@ -883,7 +913,9 @@ static void pb_scan_follow(uint32_t from_phys, uint32_t put_phys)
 
     if (!pb_walk_enabled() || (from_phys & PB_PHYS_MASK) == (put_phys & PB_PHYS_MASK))
         return;
-    /* Learn the ring's extent from the PUTs. */
+    /* Learn the ring's extent from the PUTs (the extent before this PUT is
+     * kept for telling a new ring from a lost path, below). */
+    uint32_t old_lo = s_ring_lo, old_hi = s_ring_hi;
     {
         uint32_t f = from_phys & PB_PHYS_MASK, p = put_phys & PB_PHYS_MASK;
         if (!s_ring_hi) { s_ring_lo = s_ring_hi = f; }
@@ -899,8 +931,22 @@ static void pb_scan_follow(uint32_t from_phys, uint32_t put_phys)
             fprintf(stderr, "  [PB] no path %08X -> %08X: ring changed, not"
                     " walked\n", from_phys, put_phys);
         s_seg_pend.left = 0;
-        /* A new ring (a second device): learn its extent afresh. */
-        s_ring_lo = s_ring_hi = put_phys & PB_PHYS_MASK;
+        /* A new ring (a second device): learn its extent afresh -- but only
+         * when PUT really is somewhere else. Mid-mission Ghost Recon 2 lost
+         * a path inside its own ring (0x34958 -> 0x1375EC, came round to the
+         * start), and shrinking the extent to one point made every JUMP of
+         * the ring look like a JUMP into a recorded buffer: eight segments
+         * dropped in a row, their draws (a flash of missing or wrong models)
+         * and a fence release with them (the title then waited 2 s). */
+        {
+            uint32_t p = put_phys & PB_PHYS_MASK;
+            if (!old_hi || p + 0x100000u < old_lo || p > old_hi + 0x100000u)
+                s_ring_lo = s_ring_hi = p;    /* elsewhere: a new ring */
+            else {
+                s_ring_lo = old_lo;           /* same ring: keep what we knew */
+                s_ring_hi = old_hi;
+            }
+        }
         return;
     }
     s_seg_pend = saved;
