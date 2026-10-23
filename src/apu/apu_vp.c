@@ -1421,6 +1421,52 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  * the last frame across calls in the voice's filter state.
  * ============================================================ */
 
+/* The linear interpolation below leaves images of the source spectrum at
+ * every multiple of its sample rate. At 44.1 -> 48 kHz they are out of
+ * hearing; a voice upsampled a lot is not. Ghost Recon 2's rumble is
+ * recorded at 2 kHz and stretched 24x: the images at 2, 4, 6 kHz rang as a
+ * metallic knocking over helicopters, explosions and rain, on whichever bins
+ * the voice was sent to. So a voice upsampled 1.5x or more (a source below
+ * 32 kHz) is low-passed at 0.45 of its own sample rate -- two Butterworth
+ * sections, what a band-limited resampler would have done. */
+static struct {
+    float rate, b0, b1, b2, a1, a2;
+    float z[2][2][2];                     /* [section][channel][state] */
+} s_img[MCPX_HW_MAX_VOICES];
+
+static void image_lowpass(uint16_t v, float rate, float samples[][2], int n)
+{
+    int i, s, c;
+
+    if (v >= MCPX_HW_MAX_VOICES)
+        return;
+    if (s_img[v].rate != rate) {
+        float fc = 0.45f * 48000.0f / rate, q = 0.7071f;
+        float w = 2.0f * 3.14159265f * fc / 48000.0f, cw = cosf(w);
+        float al = sinf(w) / (2.0f * q), a0 = 1.0f + al;
+        if (s_img[v].rate == 0.0f)
+            memset(s_img[v].z, 0, sizeof s_img[v].z);
+        s_img[v].rate = rate;
+        s_img[v].b0 = (1.0f - cw) / 2.0f / a0;
+        s_img[v].b1 = (1.0f - cw) / a0;
+        s_img[v].b2 = s_img[v].b0;
+        s_img[v].a1 = -2.0f * cw / a0;
+        s_img[v].a2 = (1.0f - al) / a0;
+    }
+    for (i = 0; i < n; i++)
+        for (c = 0; c < 2; c++) {
+            float x = samples[i][c];
+            for (s = 0; s < 2; s++) {
+                float *z = s_img[v].z[s][c];
+                float y = s_img[v].b0 * x + z[0];
+                z[0] = s_img[v].b1 * x - s_img[v].a1 * y + z[1];
+                z[1] = s_img[v].b2 * x - s_img[v].a2 * y;
+                x = y;
+            }
+            samples[i][c] = x;
+        }
+}
+
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
@@ -1493,6 +1539,8 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
         f->rs_pos += step;
     }
 done:
+    if (rate >= 1.5f && out > 0)
+        image_lowpass(v, rate, samples, out);
     if (out == 0 && got == 0) {
         /* Nothing new and nothing left to interpolate: the voice has stopped
          * or its stream is empty. voice_process treats 0 as an underrun and
