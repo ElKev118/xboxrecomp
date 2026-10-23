@@ -231,6 +231,35 @@ volatile float g_apu_prelimit_peak;
 #define APU_GROUPS 6
 volatile float g_apu_group_peak[APU_GROUPS];
 
+/* Two cascaded 2nd-order low-passes (Butterworth, 120 Hz at 48 kHz): -24 dB
+ * an octave, so the 2 kHz images of a stretched LFE voice are gone. */
+static float lfe_lowpass(float x)
+{
+    static int init;
+    static float b0, b1, b2, a1, a2;
+    static float z[2][2];
+    int s;
+
+    if (!init) {
+        const float fc = 120.0f, fs = 48000.0f, q = 0.7071f;
+        float w = 2.0f * 3.14159265f * fc / fs, cw = cosf(w), al = sinf(w) / (2.0f * q);
+        float a0 = 1.0f + al;
+        b0 = (1.0f - cw) / 2.0f / a0;
+        b1 = (1.0f - cw) / a0;
+        b2 = b0;
+        a1 = -2.0f * cw / a0;
+        a2 = (1.0f - al) / a0;
+        init = 1;
+    }
+    for (s = 0; s < 2; s++) {                   /* transposed direct form II */
+        float y = b0 * x + z[s][0];
+        z[s][0] = b1 * x - a1 * y + z[s][1];
+        z[s][1] = b2 * x - a2 * y;
+        x = y;
+    }
+    return x;
+}
+
 /* The stereo mix's master gain and peak limiter.
  *
  * In combat the mix ran 3-4.6x full scale for seconds at a time (the F6
@@ -297,8 +326,17 @@ static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], in
         rv_init();
     l = g_front * mixbins[0][i] + g_back * mixbins[4][i] + g_3d * (mixbins[6][i] + mixbins[8][i]);
     r = g_front * mixbins[1][i] + g_back * mixbins[5][i] + g_3d * (mixbins[7][i] + mixbins[9][i]);
-    l += g_center * mixbins[2][i] + g_lfe * mixbins[3][i];
-    r += g_center * mixbins[2][i] + g_lfe * mixbins[3][i];
+    {
+        /* The LFE bin, low-passed at 120 Hz as a subwoofer would play it.
+         * Ghost Recon 2's rumble (helicopters, explosions, rain) is LFE
+         * voices recorded at 2 kHz and stretched 24x to 48 kHz; the
+         * stretch leaves images every 2 kHz, which a subwoofer never
+         * reproduces but which, mixed straight into the stereo pair, rang
+         * as a metallic knocking ("iron rods") over the rumble. */
+        float lfe = lfe_lowpass(mixbins[3][i]);
+        l += g_center * mixbins[2][i] + g_lfe * lfe;
+        r += g_center * mixbins[2][i] + g_lfe * lfe;
+    }
     for (b = 11; b < NUM_MIXBINS; b++)
         fx += mixbins[b][i];
     {
