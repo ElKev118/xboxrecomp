@@ -285,6 +285,29 @@ static inline void hrtf_filter_process(HrtfFilter *f,
     }
 }
 
+/* The HRTF's interaural delay alone: each ear the voice delayed by its
+ * smoothed ITD, without the HRIR's filtering (which dulls and quietens the
+ * voice). Shares the filter's history and parameter smoothing. */
+static inline void hrtf_filter_process_itd(HrtfFilter *f,
+                                           float in[][2],
+                                           float out[][2]) {
+    for (int n = 0; n < HRTF_SAMPLES_PER_FRAME; n++) {
+        hrtf_filter_step_parameters(f);
+        for (int ch = 0; ch < 2; ch++) {
+            float *buf = f->ch[ch].buf;
+            buf[f->buf_pos] = in[n][ch];
+            float d = f->itd_cur * (ch == 0 ? +1.0f : -1.0f);
+            if (d < 0.0f) d = 0.0f;
+            int di = (int)d;
+            float dfrac = d - di;
+            int idx1 = (f->buf_pos - di + HRTF_BUFLEN) % HRTF_BUFLEN;
+            int idx2 = (idx1 - 1 + HRTF_BUFLEN) % HRTF_BUFLEN;
+            out[n][ch] = buf[idx1] * (1 - dfrac) + buf[idx2] * dfrac;
+        }
+        f->buf_pos = (f->buf_pos + 1) % HRTF_BUFLEN;
+    }
+}
+
 /* ============================================================
  * ADPCM Decoder - from vp/adpcm.h
  * ============================================================ */

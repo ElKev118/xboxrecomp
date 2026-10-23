@@ -222,19 +222,68 @@ int apu_vp_flat_on(void)
     return on;
 }
 
-/* The VP's HRTF on the 3D voices (RECOMP_APU_HRTF, default on as in xemu;
- * 0 turns it off). Ghost Recon 2's rain is ~60 voices playing one drop
- * sample a few ms apart; without each voice's HRIR and ITD to set them
- * apart, the copies sum into a comb filter -- a metallic ring over the rain. */
-static int apu_hrtf_on(void)
+/* The VP's HRTF on the 3D voices, RECOMP_APU_HRTF: 0 off, 1 all of them (as
+ * xemu), "itd" the interaural delay alone, "dense" (default) only the voices
+ * whose sample is playing on APU_DENSE_VOICES voices or more at once.
+ * Ghost Recon 2's rain is ~60 voices playing one drop sample a few ms
+ * apart; with nothing to set them apart the copies sum into a comb filter, a
+ * metallic ring over the rain, and the HRIR (not the delay alone) breaks it
+ * up. On every voice it also dulls and quietens speech and shots, which
+ * sounded better dry; "dense" keeps them dry. */
+#define APU_HRTF_OFF   0
+#define APU_HRTF_FULL  1
+#define APU_HRTF_ITD   2
+#define APU_HRTF_DENSE 3
+#define APU_DENSE_VOICES 8
+static int apu_hrtf_mode(void)
 {
-    static int on = -1;
-    if (on < 0) {
+    static int m = -1;
+    if (m < 0) {
         const char *e = getenv("RECOMP_APU_HRTF");
-        on = !(e && *e && atoi(e) == 0);
-        fprintf(stderr, "[APU] HRTF on the 3D voices: %s\n", on ? "on" : "off");
+        m = APU_HRTF_DENSE;
+        if (e && !strcmp(e, "0")) m = APU_HRTF_OFF;
+        else if (e && !strcmp(e, "1")) m = APU_HRTF_FULL;
+        else if (e && !strcmp(e, "itd")) m = APU_HRTF_ITD;
+        fprintf(stderr, "[APU] HRTF on the 3D voices: %s\n",
+                m == APU_HRTF_OFF ? "off" : m == APU_HRTF_FULL ? "all" :
+                m == APU_HRTF_ITD ? "delay only" : "voices sharing a sample");
     }
-    return on;
+    return m;
+}
+
+/* For "dense": how many voices played each sample base address in the last
+ * VP frame (open addressing, counted this frame into s_ba_cnt[s_ba_cur],
+ * read from the other), and for each 3D voice the base address of the
+ * source that fed its multipass bin. */
+#define BA_SLOTS 512
+static struct { uint32_t ba; uint16_t n; } s_ba_cnt[2][BA_SLOTS];
+static int s_ba_cur;
+static uint32_t s_mp_src_ba;                       /* last source in the MP list */
+static uint32_t s_3d_src_ba[MCPX_HW_MAX_3D_VOICES];
+
+static void ba_frame_start(void)
+{
+    s_ba_cur ^= 1;
+    memset(s_ba_cnt[s_ba_cur], 0, sizeof s_ba_cnt[0]);
+}
+
+static void ba_count(uint32_t ba)
+{
+    unsigned h = (ba * 2654435761u) >> 23, k;
+    for (k = 0; k < BA_SLOTS; k++, h = (h + 1) % BA_SLOTS) {
+        if (s_ba_cnt[s_ba_cur][h].n == 0) s_ba_cnt[s_ba_cur][h].ba = ba;
+        if (s_ba_cnt[s_ba_cur][h].ba == ba) { s_ba_cnt[s_ba_cur][h].n++; return; }
+    }
+}
+
+static unsigned ba_voices(uint32_t ba)
+{
+    unsigned h = (ba * 2654435761u) >> 23, k;
+    for (k = 0; k < BA_SLOTS; k++, h = (h + 1) % BA_SLOTS) {
+        if (s_ba_cnt[s_ba_cur ^ 1][h].n == 0) return 0;
+        if (s_ba_cnt[s_ba_cur ^ 1][h].ba == ba) return s_ba_cnt[s_ba_cur ^ 1][h].n;
+    }
+    return 0;
 }
 
 /* Each voice's gain on each of its 8 outputs as last mixed, and the frame it
@@ -885,6 +934,7 @@ struct VpVoiceStat {
     double   emp;                     /* multipass: energy found in its source bin */
     int      mpbin;                   /* multipass source bin, -1 if not multipass */
     const char *cls;
+    unsigned hrtf;                    /* 3D: frames the HRTF ran on it */
 };
 static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
 static int s_vstat_on = -1;
@@ -1003,7 +1053,7 @@ static void vp_stat_report(void)
         if (!s->frames && s->e3d == 0 && s->emp == 0) continue;
         fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
                 " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
-                " frames=%u rms=%.0f dc=%.0f zcr=%.2f to3d=%.0f mpbin=%d mpin=%.0f\n",
+                " frames=%u rms=%.0f dc=%.0f zcr=%.2f to3d=%.0f mpbin=%d mpin=%.0f hrtf=%u\n",
                 s_vstat_secs, v, s->fmt,
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0),
@@ -1016,9 +1066,9 @@ static void vp_stat_report(void)
                 s->sum / (s->frames ? s->frames : 1) * 32768.0,
                 (double)s->zc / (s->frames ? s->frames : 1),
                 sqrt(s->e3d / 48000.0) * 32768.0, s->mpbin,
-                sqrt(s->emp / 48000.0) * 32768.0);
+                sqrt(s->emp / 48000.0) * 32768.0, s->hrtf);
         s->frames = 0; s->zc = 0; s->sq = 0; s->sum = 0;
-        s->e3d = 0; s->emp = 0; s->mpbin = -1;
+        s->e3d = 0; s->emp = 0; s->mpbin = -1; s->hrtf = 0;
     }
     if (s_vstat_snap) {                /* the F6 snapshot: one second only */
         s_vstat_snap = 0;
@@ -1685,6 +1735,16 @@ static void voice_process(MCPXAPUState *d,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS) != 0;
     dbg->multipass = multipass;
 
+    if (!multipass) {
+        uint32_t ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
+                                     NV_PAVS_VOICE_CUR_PSL_START_BA);
+        ba_count(ba);
+        if (voice_list == 2)
+            s_mp_src_ba = ba;
+    } else if (v < MCPX_HW_MAX_3D_VOICES) {
+        s_3d_src_ba[v] = voice_list == 2 ? s_mp_src_ba : 0;
+    }
+
     if (multipass) {
         /* Read from multipass bin */
         int mp_bin = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
@@ -1804,12 +1864,22 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* HRTF processing for 3D voices */
-    if (v < MCPX_HW_MAX_3D_VOICES && apu_hrtf_on()) {
+    if (v < MCPX_HW_MAX_3D_VOICES && apu_hrtf_mode() != APU_HRTF_OFF) {
         uint16_t hrtf_handle =
             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
         if (hrtf_handle != HRTF_NULL_HANDLE) {
-            hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+            int mode = apu_hrtf_mode();
+            if (mode == APU_HRTF_DENSE)
+                mode = multipass && s_3d_src_ba[v] &&
+                       ba_voices(s_3d_src_ba[v]) >= APU_DENSE_VOICES
+                       ? APU_HRTF_FULL : APU_HRTF_OFF;
+            if (s_vstat_on > 0 && mode != APU_HRTF_OFF)
+                s_vstat[v].hrtf++;
+            if (mode == APU_HRTF_FULL)
+                hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+            else if (mode == APU_HRTF_ITD)
+                hrtf_filter_process_itd(&d->vp.filters[v].hrtf, samples, samples);
         }
     }
 
@@ -1954,6 +2024,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
     memset(g_vp_flat, 0, sizeof g_vp_flat);
     s_vp_frames++;
+    ba_frame_start();
 
     {
         /* RECOMP_APU_LISTS=<frame>: the three voice lists once, in order,
