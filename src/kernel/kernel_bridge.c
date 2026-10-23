@@ -2175,6 +2175,19 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
             for (i = 0; i < count; i++)
                 fprintf(stderr, "      [%u] token=0x%08X host=%p\n", i,
                         BRIDGE_MEM32(handles_va + i * 4), handles[i]);
+            {
+                /* Who waits: the guest code addresses above the call. */
+                uint32_t k, shown = 0;
+                fprintf(stderr, "      from");
+                for (k = 0; k < 256 && shown < 10; k++) {
+                    uint32_t v = BRIDGE_MEM32(g_esp + k * 4);
+                    if (v >= 0x00011000u && v < 0x00520000u) {
+                        fprintf(stderr, " %08X", v);
+                        shown++;
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
             fflush(stderr);
         }
     }
@@ -3597,6 +3610,24 @@ static NTSTATUS bridge_create_file_impl(
             fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
                     gpath, (unsigned)disposition, (unsigned)options,
                     g_xbox_kernel_caller, status);
+        {
+            /* RECOMP_FILE_STACK=<substring>: the guest code addresses on the
+             * stack when a matching path is opened -- which part of the
+             * title wanted it (a streaming player, a loader). */
+            const char *want = getenv("RECOMP_FILE_STACK");
+            if (want && *want && strstr(gpath, want)) {
+                uint32_t k, shown = 0;
+                fprintf(stderr, "  [FILE-STACK]");
+                for (k = 0; k < 512 && shown < 16; k++) {
+                    uint32_t v = BRIDGE_MEM32(g_esp + k * 4);
+                    if (v >= 0x00011000u && v < 0x00520000u) {
+                        fprintf(stderr, " %08X", v);
+                        shown++;
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+        }
     }
     fflush(stderr);
     return st;
@@ -4050,13 +4081,23 @@ static void bridge_NtReadFile(void)
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
-        if (poff)
-            fprintf(stderr, "  [READ] f=%lu from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+        if (poff) {
+            /* Which file: a title streaming several banks at once (music,
+             * ambience, speech) reads them all through the same wrapper. */
+            WCHAR full[MAX_PATH];
+            const WCHAR *name = L"?";
+            DWORD n = GetFinalPathNameByHandleW(handle, full, MAX_PATH, 0);
+            if (n > 0 && n < MAX_PATH) {
+                const WCHAR *sl = wcsrchr(full, L'\\');
+                name = sl ? sl + 1 : full;
+            }
+            fprintf(stderr, "  [READ] f=%lu from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X  %ls\n",
                     apu_vp_frames(), g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
-                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0, name);
+        }
         else
             fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller,
@@ -8239,16 +8280,19 @@ static void bridge_NtCreateIoCompletion(void)
 /* --- NtCreateTimer (ordinal 194, 3 args = 12 bytes)
  * NTSTATUS NtCreateTimer(PHANDLE TimerHandle, POBJECT_ATTRIBUTES
  *                        ObjectAttributes, TIMER_TYPE TimerType);
- * Creates a manual-reset waitable timer and hands its token out through the
- * handle table, matching the NtCreateEvent/NtCreateMutant pattern. */
+ * Creates a waitable timer and hands its token out through the handle table,
+ * matching the NtCreateEvent/NtCreateMutant pattern. TimerType 0 is a
+ * NotificationTimer (manual reset), 1 a SynchronizationTimer (auto reset,
+ * what CreateWaitableTimer(bManualReset=FALSE) asks for): a periodic timer
+ * made manual-reset would stay signalled after its first tick and a wait on
+ * it would return at once for ever. */
 static void bridge_NtCreateTimer(void)
 {
     HANDLE h;
 
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
 
-    h = CreateWaitableTimerW(NULL, TRUE, NULL);
+    h = CreateWaitableTimerW(NULL, STACK_ARG(2) == 0, NULL);
     if (!h) {
         fprintf(stderr, "  [KERNEL] NtCreateTimer: CreateWaitableTimerW failed (error %u)\n",
                 GetLastError());
@@ -8407,18 +8451,58 @@ static void bridge_NtSetIoCompletion(void)
     g_eax = 0;
 }
 
-/* --- NtSetTimerEx (ordinal 229, 8 args = 32 bytes) --- */
+/* --- NtSetTimerEx (ordinal 229, 8 args = 32 bytes)
+ * NTSTATUS NtSetTimerEx(HANDLE TimerHandle, PLARGE_INTEGER DueTime,
+ *     PTIMER_APC_ROUTINE TimerApcRoutine, KPROCESSOR_MODE ApcMode,
+ *     PVOID TimerContext, BOOLEAN WakeTimer, LONG Period,
+ *     PBOOLEAN PreviousState);
+ *
+ * Was a stub that returned success and armed nothing, so a waitable timer
+ * never fired. Ghost Recon 2's sound engine thread waits on its streams'
+ * events and a 50 ms periodic timer (SetWaitableTimer), and services the
+ * streams when the timer fires: with no tick the music stream was opened and
+ * never read, and the menu had no music at all.
+ *
+ * DueTime is negative for relative (100 ns units) and positive for an
+ * absolute system time; the absolute case is made relative against the
+ * title's own clock (xbox_KeQuerySystemTime), which the host timer does not
+ * share. Period is in milliseconds. An APC routine is not run (logged once):
+ * guest APCs are not delivered on host timer threads. */
 static void bridge_NtSetTimerEx(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    HANDLE   h        = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t due_va   = STACK_ARG(1);
+    uint32_t apc      = STACK_ARG(2);
+    LONG     period   = (LONG)STACK_ARG(6);
+    uint32_t prev_va  = STACK_ARG(7);
+    LARGE_INTEGER due;
+
+    if (!h || !due_va) {
+        g_eax = 0xC0000008u;              /* STATUS_INVALID_HANDLE */
+        return;
+    }
+    due.LowPart  = BRIDGE_MEM32(due_va);
+    due.HighPart = (LONG)BRIDGE_MEM32(due_va + 4);
+    if (due.QuadPart > 0) {
+        LARGE_INTEGER now;
+        xbox_KeQuerySystemTime(&now);
+        due.QuadPart = now.QuadPart - due.QuadPart;   /* negative: from now */
+        if (due.QuadPart > 0)
+            due.QuadPart = 0;                         /* already past: fire */
+    }
+    if (apc) {
+        static int warned;
+        if (!warned++) {
+            fprintf(stderr, "  [KERNEL] NtSetTimerEx: APC routine 0x%08X not run\n", apc);
+            fflush(stderr);
+        }
+    }
+    /* Not signalled, as far as anyone can tell without waiting -- and a
+     * zero-timeout wait would consume an auto-reset timer's signal. */
+    if (prev_va)
+        BRIDGE_MEM8(prev_va) = 0;
+    g_eax = SetWaitableTimer(h, &due, period > 0 ? period : 0, NULL, NULL, FALSE)
+          ? 0 : 0xC0000008u;
 }
 
 /* --- NtSignalAndWaitForSingleObjectEx (ordinal 230, 5 args = 20 bytes) --- */

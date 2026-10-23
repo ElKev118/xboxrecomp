@@ -134,6 +134,24 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
     stream_trace(d, v, "voice_off");
+    {
+        /* RECOMP_APU_OFF_TRACE: every voice turned off, buffer or stream,
+         * and where its notifier lands -- a driver that waits for a stop
+         * to be acknowledged waits on that byte. */
+        static int on = -1;
+        if (on < 0)
+            on = apu_env_on("RECOMP_APU_OFF_TRACE");
+        if (on > 0) {
+            extern unsigned long apu_vp_frames(void);
+            fprintf(stderr, "[APU-OFF] t=%lu f=%lu v=%u stream=%d active=%d fenaddr=%08X\n",
+                    (unsigned long)GetTickCount(), apu_vp_frames(), (unsigned)v,
+                    voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                   NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0,
+                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                   NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE) != 0,
+                    (unsigned)d->regs[NV_PAPU_FENADDR]);
+        }
+    }
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -1709,6 +1727,10 @@ static void vp_trace_positions(MCPXAPUState *d)
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    static uint16_t idle_v[MCPX_HW_MAX_VOICES];   /* idle voices still listed */
+    static int idle_list[MCPX_HW_MAX_VOICES];
+    int n_idle = 0;
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
     s_vp_frames++;
 
@@ -1732,18 +1754,9 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                /* One trap at a time: once the front end is trapped, a second
-                 * idle voice in the same frame would overwrite FEDECPARAM
-                 * before the ISR has read the first. The rest trap on later
-                 * frames, after the ISR has resumed the front end. */
-                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
-                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
-                    static int idle_logs = 200; /* one per frame otherwise */
-                    if (idle_logs > 0 && voice_is_stream(d, v)) {
-                        idle_logs--;
-                        stream_trace(d, v, "idle in list %d -> trap", list);
-                    }
-                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                if (n_idle < MCPX_HW_MAX_VOICES) {
+                    idle_v[n_idle] = v;
+                    idle_list[n_idle++] = list;
                 }
             } else {
                 /* Process voice directly (single-threaded) */
@@ -1751,6 +1764,54 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             }
             d->regs[current] = d->regs[next];
         }
+    }
+
+    /* Idle voices still on a list: report one to the driver, which takes it
+     * off (SE2FE_IDLE_VOICE traps the front end; DirectSound's ISR reads
+     * FEDECPARAM and unlinks the voice).
+     *
+     * One a frame: a second trap in the same frame would overwrite
+     * FEDECPARAM before the ISR has read the first. xemu traps for every
+     * idle voice, so the last one of the frame is the one the ISR sees.
+     *
+     * Not always the first, though. DirectSound acts on the idle report of a
+     * multi-voice client only for its last voice -- a 4-channel stream is
+     * two voices, and it unlinks both when the second is reported. Always
+     * reporting the first idle voice reported 216 of Ghost Recon 2's music
+     * stream (216 + 217) every frame for ever; 217 never got a turn, the
+     * driver never took the pair off the list, and the mission load that
+     * had stopped the music waited for it with no end. Taking the idle
+     * voices in turn reaches every one of them. */
+    if (n_idle > 0
+        && (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+               != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+        static unsigned rr;
+        static int idle_logs = 200;
+        int k = (int)(rr++ % (unsigned)n_idle);
+        uint16_t v = idle_v[k];
+
+        if (idle_logs > 0 && voice_is_stream(d, v)) {
+            idle_logs--;
+            stream_trace(d, v, "idle in list %d -> trap", idle_list[k]);
+        }
+        {
+            /* One voice idle and trapped for a whole second: the driver is
+             * not taking it off. Name it. */
+            static uint16_t last_v = 0xFFFF;
+            static unsigned repeats;
+            if (n_idle == 1 && v == last_v) {
+                if (++repeats == 1500)
+                    fprintf(stderr, "[APU] voice %u idle in list %d, trapped"
+                            " 1500 frames running: CFG_FMT=%08X PAR_STATE=%08X\n",
+                            (unsigned)v, idle_list[k],
+                            voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFF));
+            } else {
+                last_v = v;
+                repeats = 0;
+            }
+        }
+        fe_method(d, SE2FE_IDLE_VOICE, v);
     }
 
     vp_trace_positions(d);
