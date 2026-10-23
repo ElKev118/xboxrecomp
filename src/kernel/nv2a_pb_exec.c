@@ -722,10 +722,18 @@ static void q_run(const QHdr *h)
     }
 }
 
+/* The back-end stage's thread, for the game's sampling profiler
+ * (RECOMP_SAMPLE_THREAD=pbw). */
+void *g_pb_worker_thread;
+
 static DWORD WINAPI q_worker(LPVOID unused)
 {
     unsigned idle = 0;
     (void)unused;
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                    (HANDLE *)&g_pb_worker_thread,
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                    FALSE, 0);
     for (;;) {
         uint64_t tail = (uint64_t)s_qtail;
         uint64_t head = (uint64_t)InterlockedCompareExchange64(&s_qhead, 0, 0);
