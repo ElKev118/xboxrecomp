@@ -741,6 +741,7 @@ static int pb_follow(uint32_t from_phys, uint32_t put_phys, int dry)
      * call site was the one ahead, went round between them for ever. So
      * remember where the ring was left and go back there. */
     int in_rec = 0;
+    uint32_t rec_target = 0;              /* the recorded buffer jumped to */
     uint32_t ret_va = 0;
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t va  = 0x80000000u | (from_phys & PB_PHYS_MASK);
@@ -788,16 +789,30 @@ static int pb_follow(uint32_t from_phys, uint32_t put_phys, int dry)
             if (!in_rec && !pb_in_ring(target)) {
                 in_rec = 1;                       /* into a recorded buffer */
                 ret_va = va;                      /* the word after the JUMP */
+                rec_target = target & PB_PHYS_MASK;
             } else if (in_rec && pb_in_ring(target)) {
-                /* Back to where we left. XDK D3D leaves room after its
-                 * JUMP and returns past it; the word after the JUMP holds
-                 * that return address, a few words on. Taken only when it
-                 * says exactly that; otherwise the word after the JUMP. */
+                /* Back to where we left. D3D jumps out in one of two ways:
+                 *
+                 *   JUMP buf | ret, x, 0x80000000|buf_end, 0, 0x80000000|buf | ...
+                 *   JUMP buf | commands ...
+                 *
+                 * The first leaves a five-word gap whose first word is the
+                 * return address and whose fifth repeats the buffer's own
+                 * address; the second carries on right after the JUMP.
+                 * Telling them apart by "the next word looks like a nearby
+                 * address" mistook a method header of the second kind for a
+                 * return address (Ghost Recon 2's buffer 0x13B5FE4: header
+                 * 0x0004A310 after a JUMP at 0x4A2D4): 56 bytes of commands
+                 * skipped, a fence release among them, or a parameter 1 read
+                 * as a JUMP to 0 -- the brief flashes and 2 s fence stalls.
+                 * The fifth word says which it is. */
                 uint32_t after = *(const uint32_t *)(mem + ret_va);
+                uint32_t fifth = *(const uint32_t *)(mem + ret_va + 16);
                 uint32_t ret_phys = ret_va & PB_PHYS_MASK;
                 static unsigned n_skip, n_plain;
                 in_rec = 0;
-                if ((after & 3u) == 0 && after > ret_phys && after - ret_phys <= 64) {
+                if (fifth == (0x80000000u | rec_target)
+                    && (after & 3u) == 0 && after > ret_phys && after - ret_phys <= 64) {
                     va = 0x80000000u | after;
                     n_skip++;
                 } else {
