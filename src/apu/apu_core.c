@@ -175,6 +175,14 @@ void xbox_AudioCapture(void)
                 (int)(n / 48000) - sec, mx, slots ? over * 100 / slots : 0,
                 gmx[0], gmx[1], gmx[2], gmx[3], gmx[4], gmx[5]);
     }
+    {
+        /* The same seconds, one part of the mix at a time. */
+        extern void apu_dsp_dump_groups(const char *prefix);
+        char pre[64];
+        snprintf(pre, sizeof pre, "audio_cap%u", shot - 1);
+        apu_dsp_dump_groups(pre);
+        fprintf(stderr, "[AUDIO-CAP] per group: %s_front/_3d/_lfe/_back/_reverb.wav\n", pre);
+    }
     fflush(stderr);
     apu_vp_snapshot_request();
 }

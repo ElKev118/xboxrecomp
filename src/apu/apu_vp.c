@@ -831,7 +831,7 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
 
 struct VpVoiceStat {
     uint32_t frames, zc;
-    double   sq;
+    double   sq, sum;                 /* sum: the mean says the DC offset */
     float    last, ea, rate;
     uint32_t addr, fmt;
     uint16_t vol0, vol1;
@@ -859,7 +859,7 @@ void apu_vp_snapshot_request(void)
     if (s_vstat_on > 0)
         return;                        /* already reporting every second */
     for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++)
-        s_vstat[v].frames = 0, s_vstat[v].zc = 0, s_vstat[v].sq = 0;
+        s_vstat[v].frames = 0, s_vstat[v].zc = 0, s_vstat[v].sq = 0, s_vstat[v].sum = 0;
     s_vstat_frames = 0;
     s_vstat_snap = 1;
     s_vstat_on = 1;
@@ -906,6 +906,7 @@ static void vp_stat_samples(uint32_t v, const float samples[][2], int n,
     for (int i = 0; i < n; i++) {
         float x = samples[i][0];
         s->sq += (double)x * x;
+        s->sum += x;
         if ((x < 0) != (s->last < 0)) s->zc++;
         s->last = x;
     }
@@ -951,7 +952,7 @@ static void vp_stat_report(void)
         if (!s->frames) continue;
         fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
                 " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
-                " frames=%u rms=%.0f zcr=%.2f\n",
+                " frames=%u rms=%.0f dc=%.0f zcr=%.2f\n",
                 s_vstat_secs, v, s->fmt,
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0),
@@ -960,8 +961,9 @@ static void vp_stat_report(void)
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK)),
                 s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
                 s->cls ? s->cls : "?", s->frames,
-                sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
-        s->frames = 0; s->zc = 0; s->sq = 0;
+                sqrt(s->sq / s->frames) * 32768.0, s->sum / s->frames * 32768.0,
+                (double)s->zc / s->frames);
+        s->frames = 0; s->zc = 0; s->sq = 0; s->sum = 0;
     }
     if (s_vstat_snap) {                /* the F6 snapshot: one second only */
         s_vstat_snap = 0;
@@ -1320,6 +1322,27 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                         adpcm_block[word_index] =
                             ldl_le_phys(address_space_memory, addr);
                         linear_addr += 4;
+                    }
+                }
+                {
+                    /* RECOMP_APU_ADPCM_PEEK: the first block a voice decodes,
+                     * byte for byte, with where it was read -- to search for
+                     * in the title's wave banks. */
+                    static int peek = -1, peeks;
+                    if (peek < 0)
+                        peek = apu_env_on("RECOMP_APU_ADPCM_PEEK");
+                    if (peek > 0 && !stream && block_index == 0 && peeks < 400) {
+                        const uint8_t *bb = (const uint8_t *)adpcm_block;
+                        hwaddr a0 = stream ? segment_offset
+                                           : get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                                          0xFFFFFFFF, ba);
+                        peeks++;
+                        fprintf(stderr, "[APU-PEEK] v=%u %s ba=%08X phys=%08X %s:",
+                                (unsigned)v, stream ? "stream" : "buffer", ba,
+                                (unsigned)a0, mcpx_apu_phys_class(a0));
+                        for (unsigned k = 0; k < (unsigned)block_size && k < 36; k++)
+                            fprintf(stderr, " %02X", bb[k]);
+                        fprintf(stderr, "\n");
                     }
                 }
                 adpcm_decode_block(adpcm_decoded, (uint8_t *)adpcm_block,

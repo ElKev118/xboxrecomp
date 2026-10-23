@@ -304,9 +304,13 @@ static float soft_limit(float x)
     return x < 0 ? -a : a;
 }
 
+static void grp_put(int g, float l, float r);
+static void grp_next(void);
+
 static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int i,
                            float *outl, float *outr)
 {
+    float lfe_lp;
     static int init;
     static float g_front, g_center, g_lfe, g_back, g_3d, g_fx;
     float g_rev = xbox_AudioGetReverb();
@@ -334,6 +338,7 @@ static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], in
          * reproduces but which, mixed straight into the stereo pair, rang
          * as a metallic knocking ("iron rods") over the rumble. */
         float lfe = lfe_lowpass(mixbins[3][i]);
+        lfe_lp = lfe;
         l += g_center * mixbins[2][i] + g_lfe * lfe;
         r += g_center * mixbins[2][i] + g_lfe * lfe;
     }
@@ -358,10 +363,70 @@ static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], in
     l += g_fx * fx;
     r += g_fx * fx;
     wet = mixbins[10][i];
-    l += g_rev * rv_run(0, wet);
-    r += g_rev * rv_run(1, wet);
+    {
+        float rvl = g_rev * rv_run(0, wet), rvr = g_rev * rv_run(1, wet);
+        float lfe = g_lfe * lfe_lp;
+        l += rvl;
+        r += rvr;
+        /* Each group's stereo signal into the F6 group ring, so a capture
+         * can be listened to one part of the mix at a time. */
+        grp_put(0, g_front * mixbins[0][i], g_front * mixbins[1][i]);
+        grp_put(1, g_3d * (mixbins[6][i] + mixbins[8][i]), g_3d * (mixbins[7][i] + mixbins[9][i]));
+        grp_put(2, g_center * mixbins[2][i] + lfe, g_center * mixbins[2][i] + lfe);
+        grp_put(3, g_back * mixbins[4][i], g_back * mixbins[5][i]);
+        grp_put(4, rvl, rvr);
+        grp_next();
+    }
     *outl = l;
     *outr = r;
+}
+
+/* ---- the F6 per-group ring ------------------------------------------- */
+#define GRP_N      5
+#define GRP_FRAMES (48000 * 8)
+static int16_t s_grp[GRP_N][GRP_FRAMES][2];
+static volatile int64_t s_grp_pos;
+
+static void grp_put(int g, float l, float r)
+{
+    size_t k = (size_t)(s_grp_pos % GRP_FRAMES);
+    l *= 0.5f; r *= 0.5f;                         /* the master gain's level */
+    if (l > 1.0f) l = 1.0f; if (l < -1.0f) l = -1.0f;
+    if (r > 1.0f) r = 1.0f; if (r < -1.0f) r = -1.0f;
+    s_grp[g][k][0] = (int16_t)(l * 32767.0f);
+    s_grp[g][k][1] = (int16_t)(r * 32767.0f);
+}
+
+static void grp_next(void)
+{
+    s_grp_pos++;
+}
+
+/* Write the last 8 s of each group as <prefix>_<group>.wav. */
+void apu_dsp_dump_groups(const char *prefix)
+{
+    static const char *names[GRP_N] = { "front", "3d", "lfe", "back", "reverb" };
+    int64_t end = s_grp_pos, start = end > GRP_FRAMES ? end - GRP_FRAMES : 0;
+    uint32_t n = (uint32_t)(end - start), bytes = n * 4, v32;
+    int g;
+
+    for (g = 0; g < GRP_N; g++) {
+        char path[128];
+        FILE *f;
+        uint16_t v16;
+        snprintf(path, sizeof path, "%s_%s.wav", prefix, names[g]);
+        if (!(f = fopen(path, "wb")))
+            continue;
+        fwrite("RIFF", 1, 4, f); v32 = 36 + bytes; fwrite(&v32, 4, 1, f);
+        fwrite("WAVEfmt ", 1, 8, f); v32 = 16; fwrite(&v32, 4, 1, f);
+        v16 = 1; fwrite(&v16, 2, 1, f); v16 = 2; fwrite(&v16, 2, 1, f);
+        v32 = 48000; fwrite(&v32, 4, 1, f); v32 = 48000 * 4; fwrite(&v32, 4, 1, f);
+        v16 = 4; fwrite(&v16, 2, 1, f); v16 = 16; fwrite(&v16, 2, 1, f);
+        fwrite("data", 1, 4, f); fwrite(&bytes, 4, 1, f);
+        for (int64_t p = start; p < end; p++)
+            fwrite(s_grp[g][p % GRP_FRAMES], 4, 1, f);
+        fclose(f);
+    }
 }
 
 /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
