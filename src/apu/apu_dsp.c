@@ -217,6 +217,7 @@ static int mixdown_mode(void)
         m = 0;
         if (e && !strcmp(e, "all")) m = 1;
         else if (e && !strcmp(e, "front")) m = 2;
+        else if (e && !strcmp(e, "vp")) m = 3;      /* xemu's flat VP mix */
         else if (old && *old && atoi(old) == 0) m = 2;
     }
     return m;
@@ -621,6 +622,17 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             float left, right;
             if (mixdown_mode() == 0) {
                 downmix_stereo(mixbins, i, &left, &right);
+            } else if (mixdown_mode() == 3) {
+                /* Each voice once at its largest volume (apu_vp.c builds it),
+                 * plus the reverb on the I3DL2 send. */
+                extern float g_vp_flat[NUM_SAMPLES_PER_FRAME][2];
+                float g_rev = xbox_AudioGetReverb();
+                if (!s_rv_ready)
+                    rv_init();
+                left = g_vp_flat[i][0] + g_rev * rv_run(0, mixbins[10][i]);
+                right = g_vp_flat[i][1] + g_rev * rv_run(1, mixbins[10][i]);
+                grp_put(0, g_vp_flat[i][0], g_vp_flat[i][1]);
+                grp_next();
             } else if (mixdown_mode() == 1) {
                 left = 0.0f;
                 right = 0.0f;
@@ -639,7 +651,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 if (a > g_apu_prelimit_peak)
                     g_apu_prelimit_peak = a;
             }
-            if (mixdown_mode() == 0) {
+            if (mixdown_mode() == 0 || mixdown_mode() == 3) {
                 limit_stereo(&left, &right);
                 left = soft_limit(left);
                 right = soft_limit(right);

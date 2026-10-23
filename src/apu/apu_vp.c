@@ -208,6 +208,29 @@ static unsigned long s_vp_frames;   /* VP frames run: 1 frame = 32 samples at 48
 /* The VP frame count, as a clock other logs can share with this one. */
 unsigned long apu_vp_frames(void) { return s_vp_frames; }
 
+/* The flat stereo mix (RECOMP_APU_MIXDOWN=vp), built per frame by
+ * voice_process and read by the DSP stage's downmix. */
+float g_vp_flat[NUM_SAMPLES_PER_FRAME][2];
+
+int apu_vp_flat_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_MIXDOWN");
+        on = e && !strcmp(e, "vp");
+    }
+    return on;
+}
+
+/* Each voice's gain on each of its 8 outputs as last mixed, and the frame it
+ * was mixed in (the volume ramp in voice_process). */
+static float s_gain[MCPX_HW_MAX_VOICES][8];
+/* Submix pairing check (RECOMP_APU_TRACE): sources written to a bin since a
+ * multipass voice last read it, and how the reads went. */
+static int s_mp_writes[NUM_MIXBINS];
+static unsigned s_mp_reads, s_mp_empty, s_mp_multi;
+static unsigned long s_gain_frame[MCPX_HW_MAX_VOICES];
+
 static bool voice_is_stream(MCPXAPUState *d, uint16_t v)
 {
     return voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
@@ -570,6 +593,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_SET_HRTF_HEADROOM:
+        if (d->vp.hrtf_headroom != (uint8_t)(argument & NV1BA0_PIO_SET_HRTF_HEADROOM_AMOUNT))
+            fprintf(stderr, "[APU] HRTF headroom %u -> %u\n", d->vp.hrtf_headroom,
+                    (unsigned)(argument & NV1BA0_PIO_SET_HRTF_HEADROOM_AMOUNT));
         d->vp.hrtf_headroom = (uint8_t)(argument & NV1BA0_PIO_SET_HRTF_HEADROOM_AMOUNT);
         break;
 
@@ -620,6 +646,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                    method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
             assert((method & 3) == 0);
             slot = (method - NV1BA0_PIO_SET_SUBMIX_HEADROOM) / 4;
+            if (d->vp.submix_headroom[slot] != (uint8_t)(argument & NV1BA0_PIO_SET_SUBMIX_HEADROOM_AMOUNT))
+                fprintf(stderr, "[APU] submix %u headroom %u -> %u\n", slot,
+                        d->vp.submix_headroom[slot],
+                        (unsigned)(argument & NV1BA0_PIO_SET_SUBMIX_HEADROOM_AMOUNT));
             d->vp.submix_headroom[slot] =
                 (uint8_t)(argument & NV1BA0_PIO_SET_SUBMIX_HEADROOM_AMOUNT);
         } else if ((method >= NV1BA0_PIO_SET_OUTBUF_BA &&
@@ -836,6 +866,9 @@ struct VpVoiceStat {
     uint32_t addr, fmt;
     uint16_t vol0, vol1;
     uint8_t  bin0, bin1;
+    double   e3d;                     /* energy this voice put into bins 6-9 */
+    double   emp;                     /* multipass: energy found in its source bin */
+    int      mpbin;                   /* multipass source bin, -1 if not multipass */
     const char *cls;
 };
 static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
@@ -947,12 +980,15 @@ static void vp_stat_report(void)
         if (s_vdump_all[v]) fflush(s_vdump_all[v]);
     if (s_vstat_on <= 0) return;
     s_vstat_secs++;
+    fprintf(stderr, "[APU-MP] t=%us multipass reads %u: %u found their bin empty, %u found"
+            " more than one source\n", s_vstat_secs, s_mp_reads, s_mp_empty, s_mp_multi);
+    s_mp_reads = s_mp_empty = s_mp_multi = 0;
     for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         struct VpVoiceStat *s = &s_vstat[v];
-        if (!s->frames) continue;
+        if (!s->frames && s->e3d == 0 && s->emp == 0) continue;
         fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
                 " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
-                " frames=%u rms=%.0f dc=%.0f zcr=%.2f\n",
+                " frames=%u rms=%.0f dc=%.0f zcr=%.2f to3d=%.0f mpbin=%d mpin=%.0f\n",
                 s_vstat_secs, v, s->fmt,
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0),
@@ -961,9 +997,13 @@ static void vp_stat_report(void)
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK)),
                 s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
                 s->cls ? s->cls : "?", s->frames,
-                sqrt(s->sq / s->frames) * 32768.0, s->sum / s->frames * 32768.0,
-                (double)s->zc / s->frames);
+                sqrt(s->sq / (s->frames ? s->frames : 1)) * 32768.0,
+                s->sum / (s->frames ? s->frames : 1) * 32768.0,
+                (double)s->zc / (s->frames ? s->frames : 1),
+                sqrt(s->e3d / 48000.0) * 32768.0, s->mpbin,
+                sqrt(s->emp / 48000.0) * 32768.0);
         s->frames = 0; s->zc = 0; s->sq = 0; s->sum = 0;
+        s->e3d = 0; s->emp = 0; s->mpbin = -1;
     }
     if (s_vstat_snap) {                /* the F6 snapshot: one second only */
         s_vstat_snap = 0;
@@ -1639,6 +1679,15 @@ static void voice_process(MCPXAPUState *d,
             samples[i][0] = mixbins[mp_bin][i];
             samples[i][1] = mixbins[mp_bin][i];
         }
+        if (s_vstat_on > 0) {
+            s_mp_reads++;
+            if (s_mp_writes[mp_bin] == 0) s_mp_empty++;
+            if (s_mp_writes[mp_bin] > 1) s_mp_multi++;
+            s_mp_writes[mp_bin] = 0;
+            s_vstat[v].mpbin = mp_bin;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                s_vstat[v].emp += (double)samples[i][0] * samples[i][0];
+        }
         bool clear_mix = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                         NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX) != 0;
         if (clear_mix) {
@@ -1759,9 +1808,30 @@ static void voice_process(MCPXAPUState *d,
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
-        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += g * samples[i][b % channels];
+        {
+            /* Ramp from the gain this voice had on this output last frame to
+             * the new one, across the frame, instead of stepping to it. The
+             * VP moves a voice's current volume towards its target; taking
+             * the target at once made every DirectSound 3D update (each
+             * ~16 ms, new volumes for all the positioned voices) a step in
+             * the gain of every 3D voice -- zipper noise at 62.5 Hz and its
+             * harmonics, the metallic static over Ghost Recon 2's rain and
+             * engines. A voice not mixed last frame starts at its gain. */
+            float g0 = (s_gain_frame[v] + 1 == s_vp_frames) ? s_gain[v][b] : g;
+            if (g > 0.0f && bin[b] >= 10)
+                s_mp_writes[bin[b]]++;
+            float dg = (g - g0) / (float)NUM_SAMPLES_PER_FRAME;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                g0 += dg;
+                mixbins[bin[b]][i] += g0 * samples[i][b % channels];
+            }
+            s_gain[v][b] = g;
         }
+        if (s_vstat_on > 0 && bin[b] >= 6 && bin[b] <= 9)
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float y = g * samples[i][b % channels];
+                s_vstat[v].e3d += (double)y * y;
+            }
     }
 
     /* VP monitor mix */
@@ -1779,6 +1849,46 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    /* The flat mix xemu plays by default (its VP monitor, use_dsp off), for
+     * RECOMP_APU_MIXDOWN=vp: each voice once, at the largest of its volumes,
+     * into a stereo pair -- not summed over the bins it feeds. A voice that
+     * feeds a submix (the bin the next multipass voice in the MP list reads)
+     * leaves that bin out, as the submix comes in once through the multipass
+     * voice. Without a GP DSP to process them, summing the 3D bins (6+8, 7+9)
+     * as speakers gave Ghost Recon 2's rain and engines a loud metallic
+     * static that xemu, which does this instead, does not have. */
+    if (apu_vp_flat_on()) {
+        int mp_skip = -1;
+        float g = 0.0f;
+        if (voice_list == 2) {                       /* MP list: next multipass voice */
+            uint16_t n = (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                       NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+            for (int k = 0; n != 0xFFFF && k < MCPX_HW_MAX_VOICES; k++) {
+                if (voice_get_mask(d, n, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_MULTIPASS)) {
+                    mp_skip = (int)voice_get_mask(d, n, NV_PAVS_VOICE_CFG_FMT,
+                                                  NV_PAVS_VOICE_CFG_FMT_MULTIPASS_BIN);
+                    break;
+                }
+                n = (uint16_t)voice_get_mask(d, n, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                 NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+            }
+        }
+        for (int b = 0; b < 8; b++) {
+            float hr, bg;
+            if (bin[b] == mp_skip)
+                continue;
+            hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+            bg = attenuate(vol[b]) / hr;
+            if (bg > g) g = bg;
+        }
+        g *= ea_value;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            g_vp_flat[i][0] += g * samples[i][0];
+            g_vp_flat[i][1] += g * samples[i][1];    /* mono voices carry it in both */
+        }
+    }
+
+    s_gain_frame[v] = s_vp_frames;
     (void)voice_list;
 }
 
@@ -1827,7 +1937,41 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     int n_idle = 0;
 
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    memset(g_vp_flat, 0, sizeof g_vp_flat);
     s_vp_frames++;
+
+    {
+        /* RECOMP_APU_LISTS=<frame>: the three voice lists once, in order,
+         * with each voice's format, bins and multipass source -- how the
+         * title pairs a submix source with the voice that reads it. */
+        static long at = -2;
+        if (at == -2) {
+            const char *e = getenv("RECOMP_APU_LISTS");
+            at = e ? atol(e) : -1;
+        }
+        if (at > 0 && s_vp_frames == (unsigned long)at) {
+            static const char *ln[3] = { "2D", "3D", "MP" };
+            for (int list = 0; list < 3; list++) {
+                uint32_t h = d->regs[voice_list_regs[list].top];
+                fprintf(stderr, "[APU-LIST] %s:", ln[list]);
+                for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+                    uint16_t v = (uint16_t)h;
+                    uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+                    uint32_t vb = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, 0xFFFFFFFF);
+                    int act = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                             NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE) != 0;
+                    fprintf(stderr, " %u%s(f%08X b%u,%u%s)", (unsigned)v, act ? "" : "-",
+                            fmt, vb & 31, (vb >> 5) & 31,
+                            (fmt & NV_PAVS_VOICE_CFG_FMT_MULTIPASS)
+                                ? (fmt & NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX ? " MPc" : " MP") : "");
+                    h = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                       NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+                }
+                fprintf(stderr, "\n");
+            }
+            fflush(stderr);
+        }
+    }
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
