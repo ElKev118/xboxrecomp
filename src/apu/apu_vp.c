@@ -846,6 +846,25 @@ static FILE *s_vdump_all[MCPX_HW_MAX_VOICES];
 static uint8_t s_vdump_failed[MCPX_HW_MAX_VOICES]; /* open failed: no retry */
 static char s_vdump_prefix[512];
 static unsigned s_vstat_frames, s_vstat_secs;
+static volatile int s_vstat_snap;   /* one report on request, then off again */
+
+static void vp_stat_init(void);
+
+/* The F6 capture (xbox_AudioCapture): the voice table for the next second,
+ * whether RECOMP_APU_TRACE is on or not. */
+void apu_vp_snapshot_request(void)
+{
+    if (s_vstat_on < 0)
+        vp_stat_init();
+    if (s_vstat_on > 0)
+        return;                        /* already reporting every second */
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++)
+        s_vstat[v].frames = 0, s_vstat[v].zc = 0, s_vstat[v].sq = 0;
+    s_vstat_frames = 0;
+    s_vstat_snap = 1;
+    s_vstat_on = 1;
+    fprintf(stderr, "[AUDIO-CAP] voice table follows in a second ([APU-VSTAT] lines)\n");
+}
 
 static void vp_stat_init(void)
 {
@@ -943,6 +962,11 @@ static void vp_stat_report(void)
                 s->cls ? s->cls : "?", s->frames,
                 sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
         s->frames = 0; s->zc = 0; s->sq = 0;
+    }
+    if (s_vstat_snap) {                /* the F6 snapshot: one second only */
+        s_vstat_snap = 0;
+        s_vstat_on = 0;
+        fflush(stderr);
     }
 }
 

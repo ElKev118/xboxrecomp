@@ -222,6 +222,10 @@ static int mixdown_mode(void)
     return m;
 }
 
+/* Largest |sample| of the stereo mix before the limiter since the reader
+ * last reset it (apu_core.c, once per output period). */
+volatile float g_apu_prelimit_peak;
+
 static float soft_limit(float x)
 {
     /* Linear to 0.75, then a tanh knee that never reaches 1. */
@@ -469,6 +473,13 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             } else {
                 left = mixbins[0][i];
                 right = mixbins[1][i];
+            }
+            {
+                /* The mix's peak before the limiter, for the F6 capture:
+                 * above 0.75 the limiter is bending it, above 1.0 hard. */
+                float a = fabsf(left) > fabsf(right) ? fabsf(left) : fabsf(right);
+                if (a > g_apu_prelimit_peak)
+                    g_apu_prelimit_peak = a;
             }
             if (mixdown_mode() == 0) {
                 left = soft_limit(left);

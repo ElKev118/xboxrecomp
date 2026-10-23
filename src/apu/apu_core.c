@@ -89,6 +89,80 @@ static inline uint32_t apu_mapped_ram(void)
     return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
 }
 
+/* ---- the F6 capture: "this sound is wrong" -----------------------------
+ *
+ * The last CAP_SECONDS of the output (what the title made, before the host
+ * volume) and, per output period, the mix's peak before the limiter. On
+ * request, written as audio_cap<N>.wav with a per-second summary of how hard
+ * the limiter worked, and a table of the voices playing (the VP's per-voice
+ * statistics for the next second). Saturated explosions and odd sounds come
+ * and go; this keeps the moment the user heard. */
+#define CAP_SECONDS 8
+#define CAP_FRAMES  (48000 * CAP_SECONDS)
+static int16_t s_cap_pcm[CAP_FRAMES][2];
+static float   s_cap_peak[CAP_FRAMES / 32];      /* per 32-sample period slot */
+static volatile LONG64 s_cap_pos;                /* frames written, ever */
+extern volatile float g_apu_prelimit_peak;       /* apu_dsp.c */
+extern void apu_vp_snapshot_request(void);       /* apu_vp.c */
+
+static void cap_ring_write(const int16_t *pcm, int frames)
+{
+    LONG64 pos = s_cap_pos;
+    float peak = g_apu_prelimit_peak;
+    int i;
+
+    g_apu_prelimit_peak = 0.0f;
+    for (i = 0; i < frames; i++) {
+        size_t k = (size_t)((pos + i) % CAP_FRAMES);
+        s_cap_pcm[k][0] = pcm[2 * i];
+        s_cap_pcm[k][1] = pcm[2 * i + 1];
+        if ((k & 31) == 0)
+            s_cap_peak[k / 32] = peak;
+    }
+    s_cap_pos = pos + frames;
+}
+
+void xbox_AudioCapture(void)
+{
+    static unsigned shot;
+    LONG64 end = s_cap_pos, start = end > CAP_FRAMES ? end - CAP_FRAMES : 0;
+    uint32_t n = (uint32_t)(end - start), bytes = n * 4, v32;
+    char path[64];
+    FILE *f;
+    int sec;
+
+    snprintf(path, sizeof path, "audio_cap%u.wav", shot++);
+    if ((f = fopen(path, "wb"))) {
+        uint16_t v16;
+        fwrite("RIFF", 1, 4, f); v32 = 36 + bytes; fwrite(&v32, 4, 1, f);
+        fwrite("WAVEfmt ", 1, 8, f); v32 = 16; fwrite(&v32, 4, 1, f);
+        v16 = 1; fwrite(&v16, 2, 1, f); v16 = 2; fwrite(&v16, 2, 1, f);
+        v32 = 48000; fwrite(&v32, 4, 1, f); v32 = 48000 * 4; fwrite(&v32, 4, 1, f);
+        v16 = 4; fwrite(&v16, 2, 1, f); v16 = 16; fwrite(&v16, 2, 1, f);
+        fwrite("data", 1, 4, f); fwrite(&bytes, 4, 1, f);
+        for (LONG64 p = start; p < end; p++)
+            fwrite(s_cap_pcm[p % CAP_FRAMES], 4, 1, f);
+        fclose(f);
+    }
+    fprintf(stderr, "[AUDIO-CAP] %s: last %.1f s. Mix peak before the limiter, per"
+            " second (oldest first; >0.75 = limited, >1.0 = squashed hard):\n",
+            path, n / 48000.0);
+    for (sec = 0; sec < (int)(n / 48000); sec++) {
+        float mx = 0.0f;
+        unsigned over = 0, slots = 0;
+        for (LONG64 p = start + (LONG64)sec * 48000; p < start + (LONG64)(sec + 1) * 48000; p += 32) {
+            float pk = s_cap_peak[(p % CAP_FRAMES) / 32];
+            if (pk > mx) mx = pk;
+            over += pk > 1.0f;
+            slots++;
+        }
+        fprintf(stderr, "[AUDIO-CAP]   -%ds: peak %.2f, %u%% of the time above 1.0\n",
+                (int)(n / 48000) - sec, mx, slots ? over * 100 / slots : 0);
+    }
+    fflush(stderr);
+    apu_vp_snapshot_request();
+}
+
 /* Host output level in percent, settable while running (the port's options
  * menu). Negative until the first use reads RECOMP_AUDIO_VOLUME. */
 static volatile int s_volume = -1;
@@ -879,8 +953,10 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     /* A period dropped while pacing is stalled never reaches the device,
      * so it stays out of the dump too. */
-    if (!(xa2_is_active() && d->pace_stalled))
+    if (!(xa2_is_active() && d->pace_stalled)) {
         apu_wav_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
+        cap_ring_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
+    }
 
     /* RECOMP_AUDIO_VOLUME=<0..100>: host output level in percent (0 mutes).
      * After the WAV tap, so a capture still records what the title made.
