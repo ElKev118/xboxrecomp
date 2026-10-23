@@ -222,6 +222,21 @@ int apu_vp_flat_on(void)
     return on;
 }
 
+/* The VP's HRTF on the 3D voices (RECOMP_APU_HRTF, default on as in xemu;
+ * 0 turns it off). Ghost Recon 2's rain is ~60 voices playing one drop
+ * sample a few ms apart; without each voice's HRIR and ITD to set them
+ * apart, the copies sum into a comb filter -- a metallic ring over the rain. */
+static int apu_hrtf_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_HRTF");
+        on = !(e && *e && atoi(e) == 0);
+        fprintf(stderr, "[APU] HRTF on the 3D voices: %s\n", on ? "on" : "off");
+    }
+    return on;
+}
+
 /* Each voice's gain on each of its 8 outputs as last mixed, and the frame it
  * was mixed in (the volume ramp in voice_process). */
 static float s_gain[MCPX_HW_MAX_VOICES][8];
@@ -1789,7 +1804,7 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* HRTF processing for 3D voices */
-    if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
+    if (v < MCPX_HW_MAX_3D_VOICES && apu_hrtf_on()) {
         uint16_t hrtf_handle =
             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
