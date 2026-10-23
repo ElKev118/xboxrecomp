@@ -101,6 +101,9 @@ static inline uint32_t apu_mapped_ram(void)
 #define CAP_FRAMES  (48000 * CAP_SECONDS)
 static int16_t s_cap_pcm[CAP_FRAMES][2];
 static float   s_cap_peak[CAP_FRAMES / 32];      /* per 32-sample period slot */
+#define CAP_GROUPS 6                             /* apu_dsp.c's APU_GROUPS */
+static float   s_cap_gpeak[CAP_FRAMES / 32][CAP_GROUPS];
+extern volatile float g_apu_group_peak[CAP_GROUPS];
 static volatile LONG64 s_cap_pos;                /* frames written, ever */
 extern volatile float g_apu_prelimit_peak;       /* apu_dsp.c */
 extern void apu_vp_snapshot_request(void);       /* apu_vp.c */
@@ -108,16 +111,22 @@ extern void apu_vp_snapshot_request(void);       /* apu_vp.c */
 static void cap_ring_write(const int16_t *pcm, int frames)
 {
     LONG64 pos = s_cap_pos;
-    float peak = g_apu_prelimit_peak;
-    int i;
+    float peak = g_apu_prelimit_peak, gpk[CAP_GROUPS];
+    int i, g;
 
     g_apu_prelimit_peak = 0.0f;
+    for (g = 0; g < CAP_GROUPS; g++) {
+        gpk[g] = g_apu_group_peak[g];
+        g_apu_group_peak[g] = 0.0f;
+    }
     for (i = 0; i < frames; i++) {
         size_t k = (size_t)((pos + i) % CAP_FRAMES);
         s_cap_pcm[k][0] = pcm[2 * i];
         s_cap_pcm[k][1] = pcm[2 * i + 1];
-        if ((k & 31) == 0)
+        if ((k & 31) == 0) {
             s_cap_peak[k / 32] = peak;
+            memcpy(s_cap_gpeak[k / 32], gpk, sizeof gpk);
+        }
     }
     s_cap_pos = pos + frames;
 }
@@ -148,16 +157,23 @@ void xbox_AudioCapture(void)
             " second (oldest first; >0.75 = limited, >1.0 = squashed hard):\n",
             path, n / 48000.0);
     for (sec = 0; sec < (int)(n / 48000); sec++) {
-        float mx = 0.0f;
+        float mx = 0.0f, gmx[CAP_GROUPS] = {0};
         unsigned over = 0, slots = 0;
+        int g;
         for (LONG64 p = start + (LONG64)sec * 48000; p < start + (LONG64)(sec + 1) * 48000; p += 32) {
-            float pk = s_cap_peak[(p % CAP_FRAMES) / 32];
+            size_t slot = (size_t)((p % CAP_FRAMES) / 32);
+            float pk = s_cap_peak[slot];
             if (pk > mx) mx = pk;
+            for (g = 0; g < CAP_GROUPS; g++)
+                if (s_cap_gpeak[slot][g] > gmx[g]) gmx[g] = s_cap_gpeak[slot][g];
             over += pk > 1.0f;
             slots++;
         }
-        fprintf(stderr, "[AUDIO-CAP]   -%ds: peak %.2f, %u%% of the time above 1.0\n",
-                (int)(n / 48000) - sec, mx, slots ? over * 100 / slots : 0);
+        fprintf(stderr, "[AUDIO-CAP]   -%ds: peak %.2f, %u%% of the time above 1.0 | by bins:"
+                " front %.2f, centre/LFE %.2f, back %.2f, 3D %.2f, reverb send %.2f,"
+                " FX sends %.2f\n",
+                (int)(n / 48000) - sec, mx, slots ? over * 100 / slots : 0,
+                gmx[0], gmx[1], gmx[2], gmx[3], gmx[4], gmx[5]);
     }
     fflush(stderr);
     apu_vp_snapshot_request();

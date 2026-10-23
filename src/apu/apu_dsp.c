@@ -226,6 +226,45 @@ static int mixdown_mode(void)
  * last reset it (apu_core.c, once per output period). */
 volatile float g_apu_prelimit_peak;
 
+/* Per bin group, the same: front 0/1, centre+LFE 2/3, back 4/5, 3D 6-9,
+ * I3DL2 send 10 (before the reverb), FX sends 11-31. */
+#define APU_GROUPS 6
+volatile float g_apu_group_peak[APU_GROUPS];
+
+/* The stereo mix's master gain and peak limiter.
+ *
+ * In combat the mix ran 3-4.6x full scale for seconds at a time (the F6
+ * capture: the 3D bins, gunfire and explosions, at 1.5 on their own), and
+ * the per-sample soft clip below then bent every waveform -- the "saturated"
+ * sound. The console mixes in wide accumulators and does not distort there.
+ * So: a master gain (RECOMP_APU_GAIN_MASTER, default 0.5 = -6 dB) gives the
+ * mix headroom, and a stereo-linked limiter turns the level down smoothly
+ * when it still goes over (instant attack, ~120 ms release) instead of
+ * reshaping samples; soft_limit stays behind it as the last guard. */
+#define LIM_CEIL 0.9f
+static float s_master = -1.0f;
+static float s_lim_gain = 1.0f;
+
+static void limit_stereo(float *l, float *r)
+{
+    float peak, want;
+
+    if (s_master < 0.0f) {
+        const char *e = getenv("RECOMP_APU_GAIN_MASTER");
+        s_master = (e && *e) ? (float)atof(e) : 0.5f;
+    }
+    *l *= s_master;
+    *r *= s_master;
+    peak = fmaxf(fabsf(*l), fabsf(*r));
+    want = peak > LIM_CEIL ? LIM_CEIL / peak : 1.0f;
+    if (want < s_lim_gain)
+        s_lim_gain = want;                                  /* attack: at once */
+    else
+        s_lim_gain += (want - s_lim_gain) * (1.0f / (0.12f * 48000.0f));  /* release */
+    *l *= s_lim_gain;
+    *r *= s_lim_gain;
+}
+
 static float soft_limit(float x)
 {
     /* Linear to 0.75, then a tanh knee that never reaches 1. */
@@ -262,6 +301,22 @@ static void downmix_stereo(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], in
     r += g_center * mixbins[2][i] + g_lfe * mixbins[3][i];
     for (b = 11; b < NUM_MIXBINS; b++)
         fx += mixbins[b][i];
+    {
+        /* Each group's contribution, as it enters the mix, for the F6
+         * capture: which part of the mix drives it into the limiter. */
+        float gp[APU_GROUPS];
+        int k;
+        gp[0] = g_front * fmaxf(fabsf(mixbins[0][i]), fabsf(mixbins[1][i]));
+        gp[1] = fmaxf(fabsf(g_center * mixbins[2][i]), fabsf(g_lfe * mixbins[3][i]));
+        gp[2] = g_back * fmaxf(fabsf(mixbins[4][i]), fabsf(mixbins[5][i]));
+        gp[3] = g_3d * fmaxf(fabsf(mixbins[6][i] + mixbins[8][i]),
+                             fabsf(mixbins[7][i] + mixbins[9][i]));
+        gp[4] = fabsf(mixbins[10][i]);
+        gp[5] = g_fx * fabsf(fx);
+        for (k = 0; k < APU_GROUPS; k++)
+            if (gp[k] > g_apu_group_peak[k])
+                g_apu_group_peak[k] = gp[k];
+    }
     l += g_fx * fx;
     r += g_fx * fx;
     wet = mixbins[10][i];
@@ -482,6 +537,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                     g_apu_prelimit_peak = a;
             }
             if (mixdown_mode() == 0) {
+                limit_stereo(&left, &right);
                 left = soft_limit(left);
                 right = soft_limit(right);
             }
