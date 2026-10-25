@@ -1213,9 +1213,29 @@ static uint32_t surface_bpp(void);
 
 static void note_drawn(void)
 {
+    /* The frame to show is a surface with the display's pitch (the one the
+     * title gave AvSetDisplayMode): such a surface is never traded for one
+     * without it, and always replaces one. Largest area decided alone, and
+     * Ghost Recon 2's mission 6 renders an 800x800 16-bit shadow map (pitch
+     * 1600) after its frame: bigger than 640x480, it was presented, and the
+     * screen showed the colour-grade table that shares its address. */
+    {
+        extern uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
+        uint32_t dpitch = 0;
+        int have = !s_gpu.drawn_stale && s_gpu.drawn_offset;
+        xbox_GetDisplayFramebuffer(&dpitch);
+        if (have && dpitch) {
+            int new_ok = s_gpu.pitch == dpitch, old_ok = s_gpu.drawn_pitch == dpitch;
+            if (old_ok && !new_ok)
+                return;
+            if (new_ok && !old_ok)
+                goto take;
+        }
+    }
     if (!s_gpu.drawn_stale && s_gpu.drawn_offset
         && s_gpu.clip_w * s_gpu.clip_h < s_gpu.drawn_w * s_gpu.drawn_h)
         return;
+take:
     s_gpu.drawn_stale = 0;
     s_gpu.drawn_offset = s_gpu.color_offset;
     s_gpu.drawn_pitch = s_gpu.pitch;
