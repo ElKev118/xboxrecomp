@@ -122,6 +122,20 @@ static void *g_nv2a_memory = NULL;
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
 static void *g_mcpx_memory = NULL;
 
+/* One word of the MCPX window (the APU, DSP memories, AC'97) as the guest sees
+ * it, or 0 before the window exists: for the APU's diagnostics. */
+uint32_t xbox_McpxWord(uint32_t offset)
+{
+    return g_mcpx_memory && offset + 4 <= XBOX_MCPX_SIZE
+        ? *(volatile uint32_t *)((char *)g_mcpx_memory + offset) : 0;
+}
+
+void xbox_McpxSetWord(uint32_t offset, uint32_t value)
+{
+    if (g_mcpx_memory && offset + 4 <= XBOX_MCPX_SIZE)
+        *(volatile uint32_t *)((char *)g_mcpx_memory + offset) = value;
+}
+
 /* Flash ROM. The console's 256 KB flash is mirrored through the top of the
  * address space, and the MCPX span above stops one page short of it -- so a
  * title that touches it faulted on an address that is perfectly ordinary on

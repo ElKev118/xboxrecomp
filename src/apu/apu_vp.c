@@ -1748,6 +1748,25 @@ static void voice_process(MCPXAPUState *d,
     dbg->stereo = stereo;
     dbg->paused = paused;
 
+    /* RECOMP_APU_TRACE: a stream voice the title pauses and resumes (an XMV
+     * player holding its audio while the video catches up) leaves silent
+     * gaps in the mix; log each change with the VP frame it happened on. */
+    if (s_vstat_on > 0 && voice_is_stream(d, v)) {
+        static uint8_t s_was_paused[MCPX_HW_MAX_VOICES];
+        static unsigned long s_paused_at[MCPX_HW_MAX_VOICES];
+        if (paused != (s_was_paused[v] != 0)) {
+            fprintf(stderr, "[APU] voice %u %s at VP frame %lu%s\n", (unsigned)v,
+                    paused ? "paused" : "resumed", (unsigned long)s_vp_frames,
+                    paused ? "" : "");
+            if (paused)
+                s_paused_at[v] = (unsigned long)s_vp_frames;
+            else
+                fprintf(stderr, "[APU] voice %u was paused %.1f ms\n", (unsigned)v,
+                        (s_vp_frames - s_paused_at[v]) * 32 * 1000.0 / 48000.0);
+            s_was_paused[v] = paused;
+        }
+    }
+
     if (paused) return;
 
     /* Step filter envelope */
@@ -1836,6 +1855,25 @@ static void voice_process(MCPXAPUState *d,
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
     if (!active) return;
+
+    /* RECOMP_APU_TRACE: a stream voice whose buffer ran dry (the title has
+     * not queued the next one) is silent for as long as it stays dry. Each
+     * run of 8 frames (5 ms) or more is named, with where it ended. */
+    if (s_vstat_on > 0 && !multipass && voice_is_stream(d, v)) {
+        static unsigned s_dry_run[MCPX_HW_MAX_VOICES];
+        bool dry = true;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME && dry; i++)
+            dry = samples[i][0] == 0.0f && samples[i][1] == 0.0f;
+        if (dry) {
+            s_dry_run[v]++;
+        } else {
+            if (s_dry_run[v] >= 8)
+                fprintf(stderr, "[APU] voice %u was dry %u frames (%.1f ms), ended at VP frame %lu\n",
+                        (unsigned)v, s_dry_run[v], s_dry_run[v] * 32 * 1000.0 / 48000.0,
+                        (unsigned long)s_vp_frames);
+            s_dry_run[v] = 0;
+        }
+    }
 
     /* Get volume bins */
     int bin[8];

@@ -1185,6 +1185,11 @@ ApuIrqStats apu_irq_stats;
  * advancing is the host, not the title. */
 static int s_irq_trace = -1;
 static uint64_t s_irq_next_ns;
+/* Frame-thread passes by branch: full se_frame, front end trapped, and the
+ * lightweight pass that hands the device a silent period. */
+static unsigned s_pass_full, s_pass_trapped, s_pass_light;
+extern uint32_t xbox_McpxWord(uint32_t offset);   /* xbox_memory_layout.c */
+extern void xbox_McpxSetWord(uint32_t offset, uint32_t value);
 
 static void apu_irq_stats_line(void)
 {
@@ -1199,12 +1204,13 @@ static void apu_irq_stats_line(void)
         return;
     if (s_irq_next_ns)
         fprintf(stderr, "[APU-IRQ] traps %u se_frames %u fe-trapped-frames %u notifies %u "
-                "ssl_sets %u stream_frames %u stream_offs %u stream_paused %u underruns %u\n",
+                "ssl_sets %u stream_frames %u stream_offs %u stream_paused %u underruns %u"
+                " passes full %u trapped %u light %u\n",
                 apu_irq_stats.traps, apu_irq_stats.se_frames,
                 apu_irq_stats.fe_trapped_frames, apu_irq_stats.notifies,
                 apu_irq_stats.ssl_sets, apu_irq_stats.stream_frames,
                 apu_irq_stats.stream_offs, apu_irq_stats.stream_paused_frames,
-                xa2_underruns());
+                xa2_underruns(), s_pass_full, s_pass_trapped, s_pass_light);
     s_irq_next_ns = now + 5000000000ull;
 }
 
@@ -1241,22 +1247,71 @@ static void *mcpx_apu_frame_thread(void *arg)
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+        /* XCNTMODE selects how the global sample counter (XGSCNT) and the
+         * sample-limit interrupt count; it is not the voice processor's
+         * switch (FECTL's front end is). xemu idles on it because titles
+         * seldom touch it. Summit Strike's DirectSound writes it OFF and ON
+         * again all the time (SECTL 0x0F <-> 0x07), and the OFF stretches
+         * added up to 85% of the frames: each handed the device a silent
+         * period, which played as slow, broken audio. The frames keep
+         * running with the counter off; the counter itself and the SSL
+         * tick below still honour the mode. RECOMP_APU_GATE_XCNT=1
+         * restores the old gating. */
+        static int gate_xcnt = -1;
+        if (gate_xcnt < 0)
+            gate_xcnt = apu_env_on("RECOMP_APU_GATE_XCNT");
+        bool xcnt_on = !gate_xcnt || xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF;
+        bool apu_active = xcnt_on &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
         /* A bit test, so HALTED (0x80, a subset of TRAPPED's 0xE0) counts
          * too: xemu's frame thread idles in both modes. */
-        bool fe_trapped = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+        bool fe_trapped = xcnt_on &&
                           (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !g_test_tone.active;
 
         hs_trap(fe_trapped);
 
+        /* RECOMP_APU_EP_HEARTBEAT=<offset into the MCPX window>: the word the
+         * effects DSP's firmware keeps at 0x00CCCCCC. Later DirectSound builds
+         * (Summit Strike's) read it from DirectSoundDoWork and, if it is
+         * anything else, take the DSP for hung and reset the audio hardware:
+         * SECTL off and on, a 10 ms stall, voices restarted -- over and over,
+         * since there is no DSP to write it. The title's setup names the
+         * word (the pointer it dereferences, less 0xFE800000). */
+        {
+            static uint32_t hb_off = 0xFFFFFFFFu;
+            if (hb_off == 0xFFFFFFFFu) {
+                const char *e = getenv("RECOMP_APU_EP_HEARTBEAT");
+                hb_off = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0;
+            }
+            if (hb_off && xbox_McpxWord(hb_off) != 0x00CCCCCCu)
+                xbox_McpxSetWord(hb_off, 0x00CCCCCCu);
+        }
+
+        /* RECOMP_APU_TRACE: the registers that decide between a full frame
+         * and the silent pass, when they change. */
+        if (s_irq_trace > 0) {
+            static uint32_t last_sectl = 0xFFFFFFFFu, last_fectl = 0xFFFFFFFFu;
+            static unsigned changes;
+            uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+            if ((sectl != last_sectl || fectl != last_fectl) && changes++ < 200) {
+                fprintf(stderr, "[APU] SECTL %08X FECTL %08X (was %08X %08X) at pass %u+%u+%u, EP[0x5A018]=%08X\n",
+                        sectl, fectl, last_sectl, last_fectl,
+                        s_pass_full, s_pass_trapped, s_pass_light,
+                        xbox_McpxWord(0x5A018));
+                last_sectl = sectl;
+                last_fectl = fectl;
+            }
+        }
+
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
+            s_pass_full++;
         } else if (fe_trapped) {
+            s_pass_trapped++;
             /* The title has the APU on, but the front end is trapped (a voice
              * went idle under FETFORCE1) and stays so until DirectSound's
              * service routine clears FECTL, or the title halted it. No frame
@@ -1275,6 +1330,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
+            s_pass_light++;
         }
 
         if (div0 % 8 == 0 && d->ep_frame_div != div0)
