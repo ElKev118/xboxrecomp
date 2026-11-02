@@ -269,6 +269,7 @@ void xbox_WatchdogStart(void);
  * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
 void xbox_PeekSample(const char *label);
 void xbox_WatchInit(void);
+int xbox_WatchArmAt(uint32_t va);
 
 /* ================================================================
  * Xbox stack for recompiled code

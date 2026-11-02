@@ -50,6 +50,13 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 
+/* The same with a program and constants of the caller's own (a GPU back end
+ * placing a batch it holds, while the uploaded ones have moved on). Writes
+ * to c[] (CXT_WRITE) are not kept. */
+int  nv2a_vsh_run_with(const uint32_t (*program)[4], uint32_t start,
+                       const float (*constants)[4],
+                       const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+
 /* The loaded program and constants, for a back end that runs the program
  * itself (nv2a_vsh_glsl.h). cxt_write: SET_TRANSFORM_PROGRAM_CXT_WRITE_EN. */
 const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *cxt_write))[4];

@@ -2275,6 +2275,16 @@ static DWORD WINAPI watch_resolver(LPVOID unused)
     return 0;
 }
 
+/* Arm the watch at run time on a guest address found while the title runs
+ * (an object allocated per level), as RECOMP_WATCH=<va> does at boot. One
+ * watch per run; 1 if armed. A bring-up tool, like the rest of this. */
+int xbox_WatchArmAt(uint32_t va)
+{
+    if (g_memory_base == NULL || g_watch_page)
+        return 0;
+    return watch_arm(va);
+}
+
 void xbox_WatchInit(void)
 {
     const char *spec = getenv("RECOMP_WATCH");

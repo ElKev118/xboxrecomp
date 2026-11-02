@@ -39,6 +39,18 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+
+/* nv2a_vsh_run_with: a program and constants of the caller's own (a batch
+ * the GPU back end holds, while the executor has moved on), for this thread
+ * and this call only. NULL: the uploaded ones. */
+#if defined(_MSC_VER)
+#define VSH_TLS __declspec(thread)
+#else
+#define VSH_TLS __thread
+#endif
+static VSH_TLS const uint32_t (*t_prog)[4];
+static VSH_TLS const float (*t_const)[4];
+static VSH_TLS uint32_t t_start;
 static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
 
 /* What changed since nv2a_vsh_take_dirty last asked, as an inclusive range
@@ -273,7 +285,7 @@ static vec4 read_src(const uint32_t *ins, int which,
             ci += a0;
         if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
             ci = 0;
-        s = s_const[ci];
+        s = t_const ? t_const[ci] : s_const[ci];
     }
     r.v[0] = s[(swz >> 6) & 3];
     r.v[1] = s[(swz >> 4) & 3];
@@ -386,7 +398,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 
     if (dump < 0)
         dump = getenv("RECOMP_VSH_DUMP") != NULL;
-    if (dump && ndumped < 16) {
+    if (dump && ndumped < 16 && !t_prog) {
         /* By content: titles reload different programs into the same slot. */
         uint32_t h = 2166136261u, t;
         int i, seen = 0;
@@ -413,8 +425,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
      * unwritten stage at infinity. */
     outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
 
-    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
-        const uint32_t *ins = s_program[s];
+    for (s = t_prog ? t_start : s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = t_prog ? t_prog[s] : s_program[s];
         uint32_t mac = field(ins, 1, 21, 4), ilu = field(ins, 1, 25, 3);
         uint32_t mac_mask = field(ins, 3, 24, 4), ilu_mask = field(ins, 3, 16, 4);
         uint32_t tdst = field(ins, 3, 20, 4);
@@ -446,7 +458,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         if (omask) {
             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
+                if (s_cxt_write && !t_const && oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[oaddr], src, omask);
                     DIRTY(s_cdirty_lo, s_cdirty_hi, oaddr);
                 }
@@ -469,4 +481,18 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
     }
     return 0;
+}
+
+int nv2a_vsh_run_with(const uint32_t (*program)[4], uint32_t start,
+                      const float (*constants)[4],
+                      const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+    int r;
+    t_prog = program;
+    t_start = start;
+    t_const = constants;
+    r = nv2a_vsh_run(in, out);
+    t_prog = NULL;
+    t_const = NULL;
+    return r;
 }
