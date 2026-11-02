@@ -560,9 +560,18 @@ static void pad_script_apply(int pad, uint8_t *out)
  * options menu) has the controls, and the title must not act on them. */
 static volatile int s_input_blocked;
 
+#ifdef _WIN32
+extern void mkb_set_suspended(int on);   /* mkb_input.c */
+#endif
+
 void xbox_InputSetBlocked(int blocked)
 {
     s_input_blocked = blocked;
+#ifdef _WIN32
+    /* The mouse too: it is not read while blocked, and what it moved
+     * meanwhile must not turn the camera all at once afterwards. */
+    mkb_set_suspended(blocked);
+#endif
 }
 
 int usb_gamepad_report(int pad, uint8_t *out, int max)

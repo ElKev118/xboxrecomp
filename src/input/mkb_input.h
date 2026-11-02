@@ -51,6 +51,69 @@ int mkb_enabled(void);
  */
 int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
+/* ---- bindings ----------------------------------------------------------
+ *
+ * Which keys and mouse buttons press which pad control: a table the poll
+ * reads every time, so a change takes effect on the next frame. Each control
+ * has MKB_SLOTS inputs; any of them pressed presses it. The mouse's movement
+ * always drives the aim stick; the LOOK rows add keys for it. */
+enum {
+    MKB_A, MKB_B, MKB_X, MKB_Y, MKB_BLACK, MKB_WHITE,
+    MKB_LTRIGGER, MKB_RTRIGGER, MKB_START, MKB_BACK,
+    MKB_LTHUMB, MKB_RTHUMB,
+    MKB_DPAD_UP, MKB_DPAD_DOWN, MKB_DPAD_LEFT, MKB_DPAD_RIGHT,
+    MKB_MOVE_UP, MKB_MOVE_DOWN, MKB_MOVE_LEFT, MKB_MOVE_RIGHT,
+    MKB_LOOK_UP, MKB_LOOK_DOWN, MKB_LOOK_LEFT, MKB_LOOK_RIGHT,
+    MKB_ACTION_COUNT
+};
+#define MKB_SLOTS 2
+
+/* Input codes: 0 unbound, 1..255 a Windows virtual key (left and right
+ * Shift, Ctrl and Alt told apart: VK_LSHIFT...VK_RMENU), then the mouse. */
+#define MKB_MOUSE_LEFT    0x101
+#define MKB_MOUSE_RIGHT   0x102
+#define MKB_MOUSE_MIDDLE  0x103
+#define MKB_MOUSE_X1      0x104
+#define MKB_MOUSE_X2      0x105
+#define MKB_WHEEL_UP      0x106
+#define MKB_WHEEL_DOWN    0x107
+
+int  mkb_binding(int action, int slot);
+/* Bind code to action's slot. The code is taken off every other control
+ * first, so one key never presses two things. code 0 clears the slot. */
+void mkb_bind(int action, int slot, int code);
+/* The toolkit's own layout (Black's). A port sets its own with mkb_bind. */
+void mkb_bindings_default(void);
+/* A stable name for the action, for config files ("A", "DpadUp", ...). */
+const char *mkb_action_key(int action);
+/* The input's name for a menu: the keyboard layout's own key name. */
+void mkb_input_name(int code, char *buf, int size);
+
+/* "Press a key": the next key, mouse button or wheel step pressed after
+ * everything is released. Delete or Home cancel (they open the port menu);
+ * F9 is the capture toggle and is never taken. mkb_capture_result is -1
+ * while waiting, 0 when cancelled, else the code. */
+void mkb_capture_begin(void);
+void mkb_capture_cancel(void);
+int  mkb_capture_result(void);
+
+double mkb_sensitivity(void);
+void   mkb_set_sensitivity(double s);
+int    mkb_invert_y(void);
+void   mkb_set_invert_y(int on);
+
+/* While set (the port's menu is open) the virtual pad gives nothing and the
+ * pointer is free; on release, what was moved meanwhile is dropped. */
+void mkb_set_suspended(int on);
+
+/* The mouse's travel since the last call (counts; y down positive, or up
+ * with invert), for a title hook that turns its view directly. Calling it
+ * keeps the mouse off the right stick for the next 250 ms. 0 while the
+ * mouse is not the game's (menu open, other window). */
+int mkb_take_look(long *dx, long *dy);
+/* The mouse belongs to the game now (no pointer should show). */
+int mkb_capturing(void);
+
 #ifdef __cplusplus
 }
 #endif
