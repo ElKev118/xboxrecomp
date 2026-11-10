@@ -56,7 +56,8 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
  * Which keys and mouse buttons press which pad control: a table the poll
  * reads every time, so a change takes effect on the next frame. Each control
  * has MKB_SLOTS inputs; any of them pressed presses it. The mouse's movement
- * always drives the aim stick; the LOOK rows add keys for it. */
+ * always drives the aim stick; the LOOK rows add keys for it. 
+ * unwritt3n walk patch: added MKB_RUN*/
 enum {
     MKB_A, MKB_B, MKB_X, MKB_Y, MKB_BLACK, MKB_WHITE,
     MKB_LTRIGGER, MKB_RTRIGGER, MKB_START, MKB_BACK,
@@ -64,6 +65,7 @@ enum {
     MKB_DPAD_UP, MKB_DPAD_DOWN, MKB_DPAD_LEFT, MKB_DPAD_RIGHT,
     MKB_MOVE_UP, MKB_MOVE_DOWN, MKB_MOVE_LEFT, MKB_MOVE_RIGHT,
     MKB_LOOK_UP, MKB_LOOK_DOWN, MKB_LOOK_LEFT, MKB_LOOK_RIGHT,
+    MKB_RUN,
     MKB_ACTION_COUNT
 };
 #define MKB_SLOTS 2
