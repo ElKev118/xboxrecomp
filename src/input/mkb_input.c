@@ -139,7 +139,8 @@ void   mkb_set_invert_y(int on)     { s_cfg.invert_y = on != 0; }
 /* ---- bindings ---------------------------------------------------------- */
 
 /* Written by the menu's thread, read by the poll: one int at a time, and a
- * binding seen a poll late is a binding made a poll later. */
+ * binding seen a poll late is a binding made a poll later. 
+  * unwritt3n walk patch: added Run*/
 static volatile int s_bind[MKB_ACTION_COUNT][MKB_SLOTS];
 
 static const char *const k_action_key[MKB_ACTION_COUNT] = {
@@ -148,6 +149,7 @@ static const char *const k_action_key[MKB_ACTION_COUNT] = {
     "DpadUp", "DpadDown", "DpadLeft", "DpadRight",
     "MoveUp", "MoveDown", "MoveLeft", "MoveRight",
     "LookUp", "LookDown", "LookLeft", "LookRight",
+    "Run",
 };
 
 const char *mkb_action_key(int action)
@@ -782,11 +784,23 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
         if (action_pressed(&in, MKB_START + i))
             b |= k_digital[i];
 
-    /* ---- movement: full throw, whatever the aim sensitivity ---- */
+   /* ---- unwritt3n walk patch: walk by default, hold Left Shift to run ---- */
     {
         int mx = action_pressed(&in, MKB_MOVE_RIGHT) - action_pressed(&in, MKB_MOVE_LEFT);
         int my = action_pressed(&in, MKB_MOVE_UP) - action_pressed(&in, MKB_MOVE_DOWN);
-        if (mx || my) dir_vector(mx, my, &mov_x, &mov_y);
+        if (mx || my) {
+            if (action_pressed(&in, MKB_RUN)) {
+                /* Full square throw so diagonal sprinting keeps 100% forward axis */
+                mov_x = (SHORT)(mx * 32767);
+                mov_y = (SHORT)(my * 32767);
+            } else {
+                /* Walking: circular throw scaled to 65%, boosted on diagonals to clear deadzone */
+                double walk_scale = (mx && my) ? (0.65 * 1.25) : 0.65;
+                dir_vector(mx, my, &mov_x, &mov_y);
+                mov_x = (SHORT)(mov_x * walk_scale);
+                mov_y = (SHORT)(mov_y * walk_scale);
+            }
+        }
     }
 
     /* ---- aim: the mouse (above), else the look keys ---- */
